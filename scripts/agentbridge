@@ -102,7 +102,7 @@ def lock_path(repo_relative_path: str) -> Path:
 
 # ----- Env defaults --------------------------------------------------------
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 ENV_IDENTITY = "AGENT_BRIDGE_IDENTITY"
 ENV_SESSION = "AGENT_BRIDGE_SESSION"
 
@@ -2077,6 +2077,7 @@ def _prompt(label: str, default: str, c: dict) -> str:
 
 
 def _prompt_choice(label: str, options: list[str], default: str, c: dict) -> str:
+    """Y/n style prompt — typed answer with prefix matching. Used for confirmations."""
     opts = "/".join(o if o != default else o.upper() for o in options)
     while True:
         try:
@@ -2092,6 +2093,81 @@ def _prompt_choice(label: str, options: list[str], default: str, c: dict) -> str
             if o.startswith(v):
                 return o
         print(f"  {c['red']}choose one of: {', '.join(options)}{c['reset']}")
+
+
+def _arrow_select(label: str, options: list[tuple[str, str]],
+                  default_idx: int, c: dict) -> str | None:
+    """Arrow-key picker. options = [(value, description)]. Returns value or None.
+
+    Falls back to typed input on platforms without termios (e.g. Windows).
+    """
+    try:
+        import termios
+        import tty
+    except ImportError:
+        # No raw-mode tty available — degrade to typed input.
+        vals = [v for v, _ in options]
+        return _prompt_choice(label, vals, vals[default_idx], c) or None
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        vals = [v for v, _ in options]
+        return _prompt_choice(label, vals, vals[default_idx], c) or None
+
+    print(f"  {label}  {c['dim']}(↑/↓ to move, Enter to select){c['reset']}")
+    idx = max(0, min(default_idx, len(options) - 1))
+
+    def render(first: bool) -> None:
+        if not first:
+            # Move cursor up by len(options) to overwrite previous render.
+            sys.stdout.write(f"\033[{len(options)}A")
+        for i, (val, desc) in enumerate(options):
+            marker = f"{c['green']}▸{c['reset']}" if i == idx else " "
+            highlight_on = c['bold'] if i == idx else c['dim']
+            highlight_off = c['reset']
+            line = f"    {marker} {highlight_on}{val}{highlight_off}"
+            if desc:
+                line += f"  {c['dim']}— {desc}{c['reset']}"
+            # Clear to end-of-line in case previous render was longer.
+            sys.stdout.write("\r" + line + "\033[K\n")
+        sys.stdout.flush()
+
+    render(first=True)
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                # Could be ESC alone or the start of an arrow sequence.
+                seq = sys.stdin.read(2)
+                if seq == "[A":  # up
+                    idx = (idx - 1) % len(options)
+                    render(first=False)
+                elif seq == "[B":  # down
+                    idx = (idx + 1) % len(options)
+                    render(first=False)
+                else:
+                    return None  # ESC = cancel
+            elif ch in ("\r", "\n"):
+                return options[idx][0]
+            elif ch == "\x03":  # Ctrl-C
+                return None
+            elif ch in ("j", "J"):
+                idx = (idx + 1) % len(options)
+                render(first=False)
+            elif ch in ("k", "K"):
+                idx = (idx - 1) % len(options)
+                render(first=False)
+            elif ch.isdigit():
+                n = int(ch)
+                if 1 <= n <= len(options):
+                    idx = n - 1
+                    render(first=False)
+                    return options[idx][0]
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def _run_onboarding() -> int:
@@ -2110,10 +2186,22 @@ def _run_onboarding() -> int:
         return 0
 
     print()
-    identity = _prompt_choice("Which side are you driving?", ["claude", "codex"],
-                              env_identity() or "claude", c)
+    agent_options = [
+        ("claude", "Anthropic Claude (Claude Code, Sonnet/Opus)"),
+        ("codex",  "OpenAI Codex (codex CLI, GPT-class)"),
+    ]
+    default_agent = env_identity() or "claude"
+    default_idx = next((i for i, (v, _) in enumerate(agent_options)
+                        if v == default_agent), 0)
+    identity = _arrow_select("Which side are you driving?",
+                             agent_options, default_idx, c)
     if not identity:
         return 0
+    print()
+    print(f"  {c['dim']}Session name = a label scoping this coordination context "
+          f"(e.g. a feature{c['reset']}")
+    print(f"  {c['dim']}branch or ticket id). Both agents must use the same value "
+          f"to see each other.{c['reset']}")
     session = _prompt("Session name", env_session() or "demo", c)
     if not session:
         return 0
