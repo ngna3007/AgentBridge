@@ -1,0 +1,1194 @@
+#!/usr/bin/env python3
+"""AgentBridge — Claude↔Codex realtime bridge CLI.
+
+Local file-based message bus. Subcommands:
+  init                  bootstrap .agent-bus/ layout
+  send                  append message to messages.jsonl
+  watch                 tail messages for an agent, persist cursor
+  ack                   reply to a message (sets reply_to)
+  lock acquire          claim per-file edit lock
+  lock heartbeat        refresh lock liveness
+  lock release          drop lock
+  lock reap             force-delete stale lock
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+# ----- Constants -----------------------------------------------------------
+
+AGENT_ENUM = {"claude", "codex"}
+MSG_TYPE_ENUM = {"task", "question", "answer", "handoff", "status", "artifact", "warning"}
+PRIORITY_ENUM = {"low", "normal", "high"}
+ARTIFACT_KIND_ENUM = {"file", "diff", "command-output", "url"}
+EVENT_ENUM = {
+    "lock_acquired", "lock_released", "lock_heartbeat",
+    "watch_started", "watch_crashed", "ack_sent",
+    "stale_lock_reaped", "send_completed", "corrupt_line_skipped",
+    "override_recorded",
+}
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+
+
+# ----- Paths ---------------------------------------------------------------
+
+def bus_root() -> Path:
+    root = os.environ.get("AGENT_BUS_DIR")
+    return Path(root) if root else Path.cwd() / ".agent-bus"
+
+
+def msg_path() -> Path:
+    return bus_root() / "messages.jsonl"
+
+
+def evt_path() -> Path:
+    return bus_root() / "events.jsonl"
+
+
+def locks_dir() -> Path:
+    return bus_root() / "locks"
+
+
+def state_dir() -> Path:
+    return bus_root() / "state"
+
+
+def sessions_dir() -> Path:
+    return bus_root() / "sessions"
+
+
+def cursor_path(agent: str) -> Path:
+    return state_dir() / f"{agent}.cursor"
+
+
+def lock_key(repo_relative_path: str) -> str:
+    norm = repo_relative_path.strip().lower().replace("\\", "/")
+    norm = norm.lstrip("./")
+    return norm.replace("/", "__")
+
+
+def lock_path(repo_relative_path: str) -> Path:
+    return locks_dir() / f"{lock_key(repo_relative_path)}.lock"
+
+
+# ----- Env defaults --------------------------------------------------------
+
+VERSION = "0.2.0"
+ENV_IDENTITY = "AGENT_BRIDGE_IDENTITY"
+ENV_SESSION = "AGENT_BRIDGE_SESSION"
+
+
+def env_identity() -> str | None:
+    v = os.environ.get(ENV_IDENTITY)
+    return v if v in AGENT_ENUM else None
+
+
+def env_session() -> str | None:
+    return os.environ.get(ENV_SESSION) or None
+
+
+def require_identity(args: argparse.Namespace, attr: str) -> str:
+    """Return identity from args.<attr> or env, raising with clear msg if absent."""
+    v = getattr(args, attr, None)
+    if v:
+        return v
+    env = env_identity()
+    if env:
+        return env
+    raise ValidationError(
+        f"missing identity: pass --{attr.replace('_agent','').replace('_','-')} or "
+        f"set {ENV_IDENTITY}={'|'.join(sorted(AGENT_ENUM))}"
+    )
+
+
+def require_session(args: argparse.Namespace) -> str:
+    v = getattr(args, "session", None)
+    if v:
+        return v
+    env = env_session()
+    if env:
+        return env
+    raise ValidationError(
+        f"missing session: pass --session <id> or set {ENV_SESSION}=<id>"
+    )
+
+
+def resolve_path_arg(p: str) -> str:
+    """Validate that lock path is repo-relative (not absolute)."""
+    if os.path.isabs(p):
+        raise ValidationError(
+            f"lock path must be repo-relative, got absolute path {p!r}. "
+            f"Strip the leading '/' or use a path relative to the repo root."
+        )
+    return p
+
+
+# ----- Time / IDs ----------------------------------------------------------
+
+def now_iso() -> str:
+    n = datetime.now(timezone.utc)
+    return n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{n.microsecond // 1000:03d}Z"
+
+
+def new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def parse_iso(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+# ----- Validation ----------------------------------------------------------
+
+class ValidationError(Exception):
+    pass
+
+
+def _require(obj: dict, key: str, typ) -> Any:
+    if key not in obj:
+        raise ValidationError(f"missing field: {key}")
+    v = obj[key]
+    if not isinstance(v, typ):
+        raise ValidationError(f"field {key} must be {typ.__name__}, got {type(v).__name__}")
+    return v
+
+
+def _require_enum(obj: dict, key: str, enum: set) -> str:
+    v = _require(obj, key, str)
+    if v not in enum:
+        raise ValidationError(f"field {key}={v!r} not in {sorted(enum)}")
+    return v
+
+
+def _require_uuid(obj: dict, key: str) -> str:
+    v = _require(obj, key, str)
+    if not UUID_RE.match(v):
+        raise ValidationError(f"field {key}={v!r} not a UUIDv4")
+    return v
+
+
+def _require_iso(obj: dict, key: str) -> str:
+    v = _require(obj, key, str)
+    if not ISO_RE.match(v):
+        raise ValidationError(f"field {key}={v!r} not ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS[.sss]Z)")
+    return v
+
+
+def validate_message(m: dict) -> None:
+    _require_uuid(m, "id")
+    _require_iso(m, "ts")
+    _require(m, "session_id", str)
+    _require_enum(m, "from", AGENT_ENUM)
+    _require_enum(m, "to", AGENT_ENUM)
+    _require_enum(m, "type", MSG_TYPE_ENUM)
+    _require(m, "subject", str)
+    _require(m, "body", str)
+    _require(m, "requires_ack", bool)
+    if "priority" in m and m["priority"] is not None:
+        if m["priority"] not in PRIORITY_ENUM:
+            raise ValidationError(f"priority={m['priority']!r} not in {sorted(PRIORITY_ENUM)}")
+    if "reply_to" in m and m["reply_to"] is not None:
+        if not UUID_RE.match(m["reply_to"]):
+            raise ValidationError(f"reply_to={m['reply_to']!r} not a UUIDv4")
+    if "tags" in m and m["tags"] is not None:
+        if not isinstance(m["tags"], list) or not all(isinstance(t, str) for t in m["tags"]):
+            raise ValidationError("tags must be list[str]")
+    if "artifacts" in m and m["artifacts"] is not None:
+        if not isinstance(m["artifacts"], list):
+            raise ValidationError("artifacts must be list")
+        for i, a in enumerate(m["artifacts"]):
+            if not isinstance(a, dict):
+                raise ValidationError(f"artifacts[{i}] must be object")
+            if a.get("kind") not in ARTIFACT_KIND_ENUM:
+                raise ValidationError(f"artifacts[{i}].kind not in {sorted(ARTIFACT_KIND_ENUM)}")
+            if not isinstance(a.get("ref"), str):
+                raise ValidationError(f"artifacts[{i}].ref must be str")
+
+
+def validate_event(e: dict) -> None:
+    _require_uuid(e, "id")
+    _require_iso(e, "ts")
+    _require(e, "session_id", str)
+    actor = _require(e, "actor", str)
+    if actor not in AGENT_ENUM and actor != "agentbridge":
+        raise ValidationError(f"actor={actor!r} not in claude|codex|agentbridge")
+    _require_enum(e, "event", EVENT_ENUM)
+    if "meta" in e and e["meta"] is not None and not isinstance(e["meta"], dict):
+        raise ValidationError("meta must be object")
+
+
+# ----- Atomic JSONL append -------------------------------------------------
+
+def atomic_append(path: Path, obj: dict) -> int:
+    """Append one JSON line. Returns byte offset where the line was written.
+
+    Uses fcntl.flock(LOCK_EX) on the target file so concurrent writers
+    serialize. fsync after write ensures durability before lock release.
+    """
+    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
+    data = line.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        offset = os.lseek(fd, 0, os.SEEK_END)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    return offset
+
+
+# ----- Event helper --------------------------------------------------------
+
+def emit_event(actor: str, event: str, session_id: str, meta: dict | None = None) -> dict:
+    e = {
+        "id": new_uuid(),
+        "ts": now_iso(),
+        "session_id": session_id,
+        "actor": actor,
+        "event": event,
+        "meta": meta or {},
+    }
+    validate_event(e)
+    atomic_append(evt_path(), e)
+    return e
+
+
+# ----- Commands ------------------------------------------------------------
+
+def cmd_init(args: argparse.Namespace) -> int:
+    root = bus_root()
+    for d in (root, locks_dir(), state_dir(), sessions_dir()):
+        d.mkdir(parents=True, exist_ok=True)
+    for f in (msg_path(), evt_path()):
+        if not f.exists():
+            f.touch()
+    for p in (root, locks_dir(), state_dir(), sessions_dir()):
+        os.chmod(p, 0o700)
+    for f in (msg_path(), evt_path()):
+        os.chmod(f, 0o600)
+    print(f"initialized bus at {root}")
+    if sys.stdout.isatty():
+        print()
+        print("next steps:")
+        print(f"  export AGENT_BRIDGE_IDENTITY=claude   # or codex")
+        print(f"  export AGENT_BRIDGE_SESSION=<id>      # any name you pick")
+        print(f"  {os.path.basename(sys.argv[0])} agent-prompt --as claude --session <id>")
+        print(f"  {os.path.basename(sys.argv[0])} tmux --session <id>   # 4-pane workspace")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    sender = getattr(args, "from") or env_identity()
+    if not sender:
+        raise ValidationError(
+            f"missing sender: pass --from or set {ENV_IDENTITY}"
+        )
+    if sender == args.to:
+        raise ValidationError(f"self-message refused: --from and --to are both {sender!r}")
+    session = require_session(args)
+
+    body = args.body or ""
+    if args.body_file:
+        if args.body:
+            raise ValidationError("--body and --body-file are mutually exclusive")
+        if args.body_file == "-":
+            body = sys.stdin.read()
+        else:
+            body = Path(args.body_file).read_text()
+
+    msg = {
+        "id": new_uuid(),
+        "ts": now_iso(),
+        "session_id": session,
+        "from": sender,
+        "to": args.to,
+        "type": args.type,
+        "subject": args.subject,
+        "body": body,
+        "requires_ack": bool(args.ack),
+        "priority": args.priority,
+        "tags": args.tag or [],
+    }
+    if args.reply_to:
+        if _find_message(args.reply_to) is None:
+            raise ValidationError(f"--reply-to {args.reply_to} not found in messages.jsonl")
+        msg["reply_to"] = args.reply_to
+    if args.artifact:
+        msg["artifacts"] = [_parse_artifact(a) for a in args.artifact]
+    validate_message(msg)
+    atomic_append(msg_path(), msg)
+    emit_event("agentbridge", "send_completed", session, {
+        "msg_id": msg["id"], "from": msg["from"], "to": msg["to"], "type": msg["type"],
+    })
+    print(msg["id"])
+    if args.ack and sys.stderr.isatty():
+        print(f"sent → {args.to} (awaiting ack)", file=sys.stderr)
+    return 0
+
+
+def _parse_artifact(spec: str) -> dict:
+    parts = dict(p.split("=", 1) for p in spec.split(",") if "=" in p)
+    if "kind" not in parts or "ref" not in parts:
+        raise ValidationError(f"artifact spec {spec!r} needs kind=...,ref=...")
+    out = {"kind": parts["kind"], "ref": parts["ref"]}
+    if "sha256" in parts:
+        out["sha256"] = parts["sha256"]
+    return out
+
+
+def _read_cursor(agent: str) -> int:
+    p = cursor_path(agent)
+    if not p.exists():
+        return 0
+    try:
+        return int(p.read_text().strip() or "0")
+    except ValueError:
+        return 0
+
+
+def _write_cursor(agent: str, offset: int) -> None:
+    p = cursor_path(agent)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(str(offset))
+    os.replace(tmp, p)
+
+
+def _scan_new(path: Path, start: int) -> Iterable[tuple[int, int, bytes]]:
+    """Yield (line_start_offset, line_end_offset, raw_bytes) for new lines."""
+    if not path.exists():
+        return
+    with open(path, "rb") as f:
+        f.seek(start)
+        while True:
+            line_start = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                # partial line at end-of-file; do NOT consume
+                break
+            yield line_start, f.tell(), line
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    session = args.session or env_session() or ""
+    is_tty = sys.stdout.isatty()
+    # --pretty defaults to True on TTY, False when piped. --json forces JSON.
+    if args.json:
+        pretty = False
+    elif args.pretty:
+        pretty = True
+    else:
+        pretty = is_tty
+    color = pretty and is_tty
+
+    emit_event(agent, "watch_started", session, {"session": session})
+    cursor = _read_cursor(agent)
+    interval = args.interval / 1000.0
+    try:
+        while True:
+            new_cursor = cursor
+            for start, end, raw in _scan_new(msg_path(), cursor):
+                try:
+                    obj = json.loads(raw)
+                    validate_message(obj)
+                except (json.JSONDecodeError, ValidationError) as ex:
+                    emit_event(agent, "corrupt_line_skipped", session, {
+                        "byte_offset": start, "error": str(ex),
+                    })
+                    new_cursor = end
+                    continue
+                if obj.get("to") == agent and (not session or obj.get("session_id") == session):
+                    if pretty:
+                        sys.stdout.write(format_message_pretty(obj, color=color) + "\n")
+                    else:
+                        sys.stdout.write(json.dumps(obj) + "\n")
+                    sys.stdout.flush()
+                    if args.bell and obj.get("requires_ack") and is_tty:
+                        sys.stderr.write("\a")
+                        sys.stderr.flush()
+                new_cursor = end
+            if new_cursor != cursor:
+                _write_cursor(agent, new_cursor)
+                cursor = new_cursor
+            if args.once:
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def _find_message(msg_id: str) -> dict | None:
+    if not msg_path().exists():
+        return None
+    with open(msg_path(), "rb") as f:
+        for raw in f:
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("id") == msg_id:
+                return obj
+    return None
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    original = _find_message(args.reply_to)
+    if original is None:
+        print(f"error: message {args.reply_to} not found", file=sys.stderr)
+        return 2
+    if original.get("to") != agent:
+        print(f"error: only recipient ({original.get('to')}) may ack", file=sys.stderr)
+        return 2
+    body = args.body or ""
+    if args.body_file:
+        if args.body:
+            raise ValidationError("--body and --body-file are mutually exclusive")
+        body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+    ack_msg = {
+        "id": new_uuid(),
+        "ts": now_iso(),
+        "session_id": original["session_id"],
+        "from": agent,
+        "to": original["from"],
+        "type": "answer",
+        "subject": f"ack: {original.get('subject', '')}",
+        "body": body,
+        "requires_ack": False,
+        "reply_to": args.reply_to,
+        "priority": "normal",
+        "tags": ["ack"],
+    }
+    validate_message(ack_msg)
+    atomic_append(msg_path(), ack_msg)
+    emit_event(agent, "ack_sent", original["session_id"], {
+        "ack_id": ack_msg["id"], "reply_to": args.reply_to,
+    })
+    print(ack_msg["id"])
+    return 0
+
+
+# ----- Locks ---------------------------------------------------------------
+
+def _read_lock(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def _lock_is_stale(lock: dict) -> bool:
+    try:
+        hb = parse_iso(lock["heartbeat_at"])
+        ttl = int(lock["ttl_seconds"])
+    except (KeyError, ValueError):
+        return True
+    return (datetime.now(timezone.utc) - hb).total_seconds() > ttl
+
+
+def _write_lock_atomic(path: Path, body: dict, exclusive: bool) -> bool:
+    """Write lock file. If exclusive, fail when path exists. Returns True on success."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT
+    if exclusive:
+        flags |= os.O_EXCL
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            return False
+        raise
+    try:
+        os.write(fd, json.dumps(body, indent=2).encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
+def cmd_lock_acquire(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    rel = resolve_path_arg(args.path)
+    path = lock_path(rel)
+    session = args.session or env_session() or ""
+    deadline = time.monotonic() + max(args.wait, 0)
+
+    while True:
+        existing = _read_lock(path)
+        if existing is not None and not _lock_is_stale(existing):
+            if time.monotonic() >= deadline:
+                print(f"error: lock held by {existing.get('owner')} since {existing.get('acquired_at')}",
+                      file=sys.stderr)
+                return 1
+            time.sleep(0.1)
+            continue
+        if existing is not None and _lock_is_stale(existing):
+            emit_event(agent, "stale_lock_reaped", session, {
+                "path": rel, "prior_lock_id": existing.get("lock_id"),
+                "prior_owner": existing.get("owner"),
+            })
+            path.unlink(missing_ok=True)
+        body = {
+            "lock_id": new_uuid(),
+            "owner": agent,
+            "path": rel,
+            "acquired_at": now_iso(),
+            "heartbeat_at": now_iso(),
+            "ttl_seconds": args.ttl,
+            "reason": args.reason or "",
+        }
+        if _write_lock_atomic(path, body, exclusive=True):
+            emit_event(agent, "lock_acquired", session, {
+                "path": rel, "lock_id": body["lock_id"],
+            })
+            print(body["lock_id"])
+            return 0
+        # Race: another writer beat us between unlink and create.
+        if time.monotonic() >= deadline:
+            print("error: lock acquire raced", file=sys.stderr)
+            return 1
+        time.sleep(0.1)
+
+
+def cmd_lock_heartbeat(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    rel = resolve_path_arg(args.path)
+    path = lock_path(rel)
+    session = args.session or env_session() or ""
+    existing = _read_lock(path)
+    if existing is None:
+        print("error: no lock to heartbeat", file=sys.stderr)
+        return 1
+    if existing.get("owner") != agent:
+        print(f"error: lock owned by {existing.get('owner')}, not {agent}", file=sys.stderr)
+        return 1
+    existing["heartbeat_at"] = now_iso()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(existing, indent=2))
+    os.replace(tmp, path)
+    emit_event(agent, "lock_heartbeat", session, {
+        "path": rel, "lock_id": existing.get("lock_id"),
+    })
+    return 0
+
+
+def cmd_lock_release(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    rel = resolve_path_arg(args.path)
+    path = lock_path(rel)
+    session = args.session or env_session() or ""
+    existing = _read_lock(path)
+    if existing is None:
+        print("error: no lock to release", file=sys.stderr)
+        return 1
+    if existing.get("owner") != agent and not args.force:
+        print(f"error: lock owned by {existing.get('owner')}, not {agent}; use --force to override", file=sys.stderr)
+        return 1
+    path.unlink()
+    emit_event(agent, "lock_released", session, {
+        "path": rel, "lock_id": existing.get("lock_id"),
+    })
+    return 0
+
+
+def cmd_lock_reap(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    rel = resolve_path_arg(args.path)
+    path = lock_path(rel)
+    session = args.session or env_session() or ""
+    existing = _read_lock(path)
+    if existing is None:
+        print("error: no lock at path", file=sys.stderr)
+        return 1
+    stale = _lock_is_stale(existing)
+    if not stale:
+        if not args.force_stale:
+            print("error: lock not stale; emergency override requires --force-stale "
+                  f"AND prior warning msg tagged 'override:{lock_key(rel)}'",
+                  file=sys.stderr)
+            return 1
+        owner = existing.get("owner")
+        warn = _find_override_warning(agent, owner, lock_key(rel), args.window)
+        if warn is None:
+            print(f"error: override refused — no recent warning msg from {agent}"
+                  f" to {owner} tagged 'override:{lock_key(rel)}' within {args.window}s",
+                  file=sys.stderr)
+            return 1
+        emit_event(agent, "override_recorded", session, {
+            "path": rel, "lock_id": existing.get("lock_id"),
+            "prior_owner": owner, "warning_msg_id": warn["id"],
+        })
+    path.unlink()
+    emit_event(agent, "stale_lock_reaped", session, {
+        "path": rel, "lock_id": existing.get("lock_id"),
+        "prior_owner": existing.get("owner"), "was_stale": stale,
+    })
+    return 0
+
+
+# ----- New UX commands: key, with-hold, inbox, agent-prompt, version -------
+
+def cmd_lock_key(args: argparse.Namespace) -> int:
+    rel = resolve_path_arg(args.path)
+    print(lock_key(rel))
+    return 0
+
+
+def cmd_lock_with_hold(args: argparse.Namespace) -> int:
+    """Acquire lock, run user command, auto-heartbeat in background, release on exit."""
+    import signal
+    import subprocess as sp
+    import threading
+
+    agent = require_identity(args, "as_agent")
+    rel = resolve_path_arg(args.path)
+    session = args.session or env_session() or ""
+
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd.pop(0)
+    if not cmd:
+        print("error: no command given after `--`", file=sys.stderr)
+        return 2
+
+    # Acquire (with optional wait).
+    fake_args = argparse.Namespace(
+        as_agent=agent, path=rel, ttl=args.ttl, reason=args.reason,
+        session=session, wait=args.wait,
+    )
+    rc = cmd_lock_acquire(fake_args)
+    if rc != 0:
+        return rc
+
+    stop = threading.Event()
+    hb_interval = max(1, args.ttl // 3)
+
+    def heartbeat_loop():
+        while not stop.wait(hb_interval):
+            try:
+                cmd_lock_heartbeat(argparse.Namespace(
+                    as_agent=agent, path=rel, session=session,
+                ))
+            except Exception:
+                pass
+
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
+
+    proc = None
+
+    def cleanup(*_):
+        stop.set()
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        try:
+            cmd_lock_release(argparse.Namespace(
+                as_agent=agent, path=rel, force=False, session=session,
+            ))
+        except Exception as ex:
+            print(f"warning: release failed: {ex}", file=sys.stderr)
+
+    signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(130)))
+    signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(143)))
+
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd.pop(0)
+    if not cmd:
+        print("error: no command given after `--`", file=sys.stderr)
+        cleanup()
+        return 2
+
+    try:
+        proc = sp.Popen(cmd)
+        rc = proc.wait()
+    finally:
+        cleanup()
+    return rc
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    session = args.session or env_session() or ""
+    cursor_off = _read_cursor(agent) if args.unread else 0
+    is_tty = sys.stdout.isatty()
+    pretty = (not args.json) and (args.pretty or is_tty)
+    color = pretty and is_tty
+
+    count = 0
+    for start, end, raw in _scan_new(msg_path(), cursor_off):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("to") != agent:
+            continue
+        if session and obj.get("session_id") != session:
+            continue
+        if args.type and obj.get("type") != args.type:
+            continue
+        if args.needs_ack and not obj.get("requires_ack"):
+            continue
+        if pretty:
+            print(format_message_pretty(obj, color=color))
+        else:
+            print(json.dumps(obj))
+        count += 1
+    if pretty and is_tty:
+        print(f"\n— {count} message(s) {'unread' if args.unread else 'total'} for {agent}"
+              f"{' in session '+session if session else ''}",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_agent_prompt(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    session = args.session or env_session() or "<your-session-id>"
+    other = next(iter(AGENT_ENUM - {agent}))
+    self_path = os.path.abspath(sys.argv[0])
+    print(f"""# AgentBridge — operator instructions for {agent}
+
+You share a workspace with **{other}**. All inter-agent coordination
+goes through the local CLI `agentbridge` (no network).
+
+Your identity is `{agent}` and your session is `{session}`.
+Set these so you don't pass them on every call:
+
+```bash
+export AGENT_BRIDGE_IDENTITY={agent}
+export AGENT_BRIDGE_SESSION={session}
+```
+
+## Inbox
+
+- Check pending work: `{self_path} inbox`
+- Watch for new messages live: `{self_path} watch`
+- For ack-required messages, reply with:
+  `{self_path} ack --reply-to <msg-id> --body "..."`
+
+## Sending
+
+- Hand off work or ask a question:
+  `{self_path} send --to {other} --type {{task|question|status|handoff|answer|warning|artifact}} --subject "..." --body "..." [--ack]`
+- For long bodies pipe stdin: `... --body-file -` and paste, end with Ctrl-D.
+
+## Edit locks (REQUIRED before editing any file {other} might touch)
+
+- Quick path: `{self_path} lock with-hold --path <repo/relative/path> -- <your-editor-cmd>`
+  - Acquires lock, auto-heartbeats, releases on command exit.
+- Manual:
+  - `{self_path} lock acquire --path <p> --ttl 120 [--wait 30] --reason "..."`
+  - heartbeat every 20s if you hold longer than ttl/3
+  - `{self_path} lock release --path <p>`
+- If contended, send a question to {other} and wait for ack rather than overriding.
+- Emergency only: send a `warning` msg tagged `override:<key>` (see
+  `{self_path} lock key <path>`), then `lock reap --force-stale`.
+
+## Observability
+
+- `{self_path} status` — health snapshot
+- `{self_path} transcript` — full session timeline
+""")
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    print(f"agentbridge {VERSION}")
+    return 0
+
+
+# ----- Pretty rendering ----------------------------------------------------
+
+def _color(enabled: bool):
+    if enabled:
+        return {
+            "msg": "\033[36m", "evt": "\033[35m", "ts": "\033[2m",
+            "ack": "\033[33m", "task": "\033[1;32m", "warn": "\033[1;31m",
+            "rst": "\033[0m",
+        }
+    return {k: "" for k in ("msg", "evt", "ts", "ack", "task", "warn", "rst")}
+
+
+def format_message_pretty(m: dict, color: bool = False) -> str:
+    c = _color(color)
+    kind_color = {
+        "task": c["task"], "warning": c["warn"], "answer": c["ack"],
+    }.get(m.get("type"), c["msg"])
+    line = (
+        f"{c['ts']}{m['ts']}{c['rst']}  "
+        f"{kind_color}{m.get('from')}→{m.get('to')} [{m.get('type')}]{c['rst']}  "
+        f"{m.get('subject','')}"
+    )
+    if m.get("reply_to"):
+        line += f"  {c['ts']}(reply_to={m['reply_to'][:8]}){c['rst']}"
+    if m.get("requires_ack"):
+        line += f"  {c['ack']}[needs-ack]{c['rst']}"
+    if m.get("body"):
+        body = m["body"]
+        if len(body) > 200:
+            body = body[:200] + "…"
+        line += f"\n    {body}"
+    return line
+
+
+def format_event_pretty(e: dict, color: bool = False) -> str:
+    c = _color(color)
+    meta = e.get("meta") or {}
+    bits = []
+    for k in ("path", "msg_id", "ack_id", "lock_id", "reply_to",
+             "prior_owner", "byte_offset", "warning_msg_id"):
+        if k in meta:
+            v = str(meta[k])
+            if len(v) > 36:
+                v = v[:8] + "…"
+            bits.append(f"{k}={v}")
+    return (
+        f"{c['ts']}{e['ts']}{c['rst']}  "
+        f"{c['evt']}EVT {e.get('actor')} {e.get('event')}{c['rst']}  "
+        + " ".join(bits)
+    ).rstrip()
+
+
+# ----- Iteration helpers ---------------------------------------------------
+
+def _iter_jsonl(path: Path) -> Iterable[dict]:
+    if not path.exists():
+        return
+    with open(path, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                yield json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+
+def _iter_messages() -> Iterable[dict]:
+    return _iter_jsonl(msg_path())
+
+
+def _iter_events() -> Iterable[dict]:
+    return _iter_jsonl(evt_path())
+
+
+# ----- Override guardrail (Phase 3.4) --------------------------------------
+
+OVERRIDE_TAG_PREFIX = "override:"
+
+
+def _find_override_warning(reaper: str, owner: str, lkey: str, window_s: int) -> dict | None:
+    """Locate recent `warning` msg from reaper→owner authorizing override of lkey."""
+    cutoff = datetime.now(timezone.utc).timestamp() - window_s
+    target_tag = f"{OVERRIDE_TAG_PREFIX}{lkey}"
+    latest = None
+    for m in _iter_messages():
+        if m.get("type") != "warning":
+            continue
+        if m.get("from") != reaper or m.get("to") != owner:
+            continue
+        if target_tag not in (m.get("tags") or []):
+            continue
+        try:
+            ts = parse_iso(m["ts"]).timestamp()
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        if latest is None or ts > parse_iso(latest["ts"]).timestamp():
+            latest = m
+    return latest
+
+
+# ----- Transcript (Phase 4.2) ---------------------------------------------
+
+def cmd_transcript(args: argparse.Namespace) -> int:
+    session = args.session
+    entries: list[tuple[str, str, dict]] = []
+    for m in _iter_messages():
+        if session and m.get("session_id") != session:
+            continue
+        entries.append((m["ts"], "msg", m))
+    for e in _iter_events():
+        if session and e.get("session_id") != session:
+            continue
+        entries.append((e["ts"], "evt", e))
+    entries.sort(key=lambda x: x[0])
+
+    if args.format == "jsonl":
+        for ts, kind, obj in entries:
+            sys.stdout.write(json.dumps({"kind": kind, **obj}) + "\n")
+        return 0
+
+    for ts, kind, obj in entries:
+        if kind == "msg":
+            line = (
+                f"{ts}  MSG  {obj.get('from')}→{obj.get('to')}  "
+                f"[{obj.get('type')}] {obj.get('subject', '')}"
+            )
+            if obj.get("reply_to"):
+                line += f"  (reply_to={obj['reply_to'][:8]})"
+            if obj.get("requires_ack"):
+                line += "  [needs-ack]"
+        else:
+            meta = obj.get("meta") or {}
+            extra = " ".join(f"{k}={v}" for k, v in meta.items() if k in
+                             {"path", "lock_id", "msg_id", "reply_to", "ack_id",
+                              "prior_owner", "byte_offset"})
+            line = f"{ts}  EVT  {obj.get('actor')}  {obj.get('event')}  {extra}".rstrip()
+        print(line)
+    return 0
+
+
+# ----- tmux helper (Phase 4.3) --------------------------------------------
+
+def cmd_tmux(args: argparse.Namespace) -> int:
+    import shutil
+    import subprocess as sp
+    if not shutil.which("tmux"):
+        print("error: tmux not on PATH", file=sys.stderr)
+        return 2
+    session = args.session
+    log_claude = sessions_dir() / f"{session}.claude.log"
+    log_codex = sessions_dir() / f"{session}.codex.log"
+    sessions_dir().mkdir(parents=True, exist_ok=True)
+    self_path = os.path.abspath(sys.argv[0])
+    name = args.name or f"agentbridge-{session}"
+    try:
+        sp.check_call(["tmux", "kill-session", "-t", name],
+                      stderr=sp.DEVNULL, stdout=sp.DEVNULL)
+    except sp.CalledProcessError:
+        pass
+    # 4 panes: claude shell, codex shell, watch claude, watch codex
+    claude_cmd = f"script -q -f {log_claude} bash"
+    codex_cmd = f"script -q -f {log_codex} bash"
+    watch_claude = f"{self_path} watch --as claude --session {session}"
+    watch_codex = f"{self_path} watch --as codex --session {session}"
+    sp.check_call(["tmux", "new-session", "-d", "-s", name, claude_cmd])
+    sp.check_call(["tmux", "split-window", "-t", name, "-h", codex_cmd])
+    sp.check_call(["tmux", "split-window", "-t", f"{name}.0", "-v", watch_claude])
+    sp.check_call(["tmux", "split-window", "-t", f"{name}.2", "-v", watch_codex])
+    sp.check_call(["tmux", "select-layout", "-t", name, "tiled"])
+    print(f"tmux session: {name}")
+    print(f"attach: tmux attach -t {name}")
+    print(f"logs: {log_claude}  {log_codex}")
+    return 0
+
+
+# ----- Status --------------------------------------------------------------
+
+def cmd_status(args: argparse.Namespace) -> int:
+    root = bus_root()
+    print(f"bus: {root}  (exists={root.exists()})")
+    if not root.exists():
+        return 0
+    mc = sum(1 for _ in _iter_messages())
+    ec = sum(1 for _ in _iter_events())
+    locks = list(locks_dir().glob("*.lock")) if locks_dir().exists() else []
+    print(f"messages: {mc}  events: {ec}  active locks: {len(locks)}")
+    for p in locks:
+        body = _read_lock(p)
+        stale = body and _lock_is_stale(body)
+        if body:
+            print(f"  - {body.get('path')}  owner={body.get('owner')}  "
+                  f"stale={stale}  heartbeat={body.get('heartbeat_at')}")
+    if state_dir().exists():
+        for c in state_dir().glob("*.cursor"):
+            print(f"  cursor {c.name}: {c.read_text().strip()}")
+    return 0
+
+
+# ----- argparse ------------------------------------------------------------
+
+def _identity_kwargs(env_var: str):
+    """Argparse kwargs for an identity flag — required only if env not set."""
+    env_val = os.environ.get(env_var)
+    if env_val in AGENT_ENUM:
+        return {"required": False, "default": env_val, "choices": sorted(AGENT_ENUM)}
+    return {"required": False, "default": None, "choices": sorted(AGENT_ENUM)}
+
+
+def _session_kwargs():
+    return {"default": os.environ.get(ENV_SESSION, "")}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="agentbridge",
+        description=f"AgentBridge {VERSION} — local Claude↔Codex bridge",
+        epilog=f"Env defaults: {ENV_IDENTITY}=<claude|codex>  {ENV_SESSION}=<session-id>",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="bootstrap .agent-bus/").set_defaults(func=cmd_init)
+    sub.add_parser("version", help="print version").set_defaults(func=cmd_version)
+    sub.add_parser("status", help="show bus health").set_defaults(func=cmd_status)
+
+    # ---- send ----
+    s = sub.add_parser("send", help="send a message")
+    s.add_argument("--from", **_identity_kwargs(ENV_IDENTITY),
+                   help="sender (default: $AGENT_BRIDGE_IDENTITY)")
+    s.add_argument("--to", required=True, choices=sorted(AGENT_ENUM),
+                   help="recipient")
+    s.add_argument("--type", required=True, choices=sorted(MSG_TYPE_ENUM))
+    s.add_argument("--subject", required=True)
+    s.add_argument("--body", default="")
+    s.add_argument("--body-file", default=None,
+                   help="read body from FILE (or '-' for stdin)")
+    s.add_argument("--session", **_session_kwargs(),
+                   help="session id (default: $AGENT_BRIDGE_SESSION)")
+    s.add_argument("--ack", action="store_true", help="require ack")
+    s.add_argument("--reply-to", default=None, help="parent message uuid")
+    s.add_argument("--priority", default="normal", choices=sorted(PRIORITY_ENUM))
+    s.add_argument("--tag", action="append", default=[])
+    s.add_argument("--artifact", action="append", default=[],
+                   help="kind=file,ref=path/to/x[,sha256=...]")
+    s.set_defaults(func=cmd_send)
+
+    # ---- watch ----
+    w = sub.add_parser("watch", help="tail messages for an agent")
+    w.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY),
+                   help="identity (default: $AGENT_BRIDGE_IDENTITY)")
+    w.add_argument("--session", **_session_kwargs())
+    w.add_argument("--interval", type=int, default=200, help="poll interval ms")
+    w.add_argument("--once", action="store_true", help="drain once and exit")
+    w.add_argument("--pretty", action="store_true",
+                   help="force pretty output (default: auto by TTY)")
+    w.add_argument("--json", action="store_true",
+                   help="force JSON output (overrides --pretty)")
+    w.add_argument("--bell", action="store_true",
+                   help="ring terminal bell on requires_ack messages")
+    w.set_defaults(func=cmd_watch)
+
+    # ---- ack ----
+    a = sub.add_parser("ack", help="reply to a requires_ack message")
+    a.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    a.add_argument("--reply-to", required=True)
+    a.add_argument("--body", default="")
+    a.add_argument("--body-file", default=None,
+                   help="read body from FILE (or '-' for stdin)")
+    a.set_defaults(func=cmd_ack)
+
+    # ---- inbox ----
+    ib = sub.add_parser("inbox", help="snapshot pending messages (non-blocking)")
+    ib.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    ib.add_argument("--session", **_session_kwargs())
+    ib.add_argument("--unread", action="store_true",
+                    help="only show messages past the cursor")
+    ib.add_argument("--type", choices=sorted(MSG_TYPE_ENUM),
+                    help="filter by message type")
+    ib.add_argument("--needs-ack", action="store_true",
+                    help="only show requires_ack messages")
+    ib.add_argument("--pretty", action="store_true")
+    ib.add_argument("--json", action="store_true")
+    ib.set_defaults(func=cmd_inbox)
+
+    # ---- lock {acquire,heartbeat,release,reap,key,with-hold} ----
+    lk = sub.add_parser("lock", help="lock subcommands")
+    lksub = lk.add_subparsers(dest="lock_cmd", required=True)
+
+    la = lksub.add_parser("acquire", help="acquire per-file edit lock")
+    la.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    la.add_argument("--path", required=True, help="repo-relative path")
+    la.add_argument("--ttl", type=int, default=120, help="seconds")
+    la.add_argument("--reason", default="")
+    la.add_argument("--session", **_session_kwargs())
+    la.add_argument("--wait", type=int, default=0,
+                    help="block up to N seconds waiting for lock (default 0)")
+    la.set_defaults(func=cmd_lock_acquire)
+
+    lh = lksub.add_parser("heartbeat", help="refresh lock liveness")
+    lh.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    lh.add_argument("--path", required=True)
+    lh.add_argument("--session", **_session_kwargs())
+    lh.set_defaults(func=cmd_lock_heartbeat)
+
+    lr = lksub.add_parser("release", help="drop your lock")
+    lr.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    lr.add_argument("--path", required=True)
+    lr.add_argument("--force", action="store_true")
+    lr.add_argument("--session", **_session_kwargs())
+    lr.set_defaults(func=cmd_lock_release)
+
+    lp = lksub.add_parser("reap", help="force-delete stale/overridden lock")
+    lp.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    lp.add_argument("--path", required=True)
+    lp.add_argument("--force-stale", action="store_true",
+                    help="override non-stale lock (requires prior warning msg)")
+    lp.add_argument("--window", type=int, default=60)
+    lp.add_argument("--session", **_session_kwargs())
+    lp.set_defaults(func=cmd_lock_reap)
+
+    lkey = lksub.add_parser("key", help="print the normalized lock key for a path")
+    lkey.add_argument("path")
+    lkey.set_defaults(func=cmd_lock_key)
+
+    lwh = lksub.add_parser("with-hold",
+                           help="run a command while holding a lock (auto heartbeat + release)")
+    lwh.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    lwh.add_argument("--path", required=True)
+    lwh.add_argument("--ttl", type=int, default=120)
+    lwh.add_argument("--wait", type=int, default=0)
+    lwh.add_argument("--reason", default="")
+    lwh.add_argument("--session", **_session_kwargs())
+    lwh.add_argument("cmd", nargs=argparse.REMAINDER,
+                     help="-- <command> [args...]  (the actual command to run)")
+    lwh.set_defaults(func=cmd_lock_with_hold)
+
+    # ---- transcript / tmux / agent-prompt ----
+    t = sub.add_parser("transcript", help="reconstruct timeline from logs")
+    t.add_argument("--session", **_session_kwargs())
+    t.add_argument("--format", choices=["pretty", "jsonl"], default="pretty")
+    t.set_defaults(func=cmd_transcript)
+
+    tmx = sub.add_parser("tmux", help="spawn 4-pane tmux topology")
+    tmx.add_argument("--session", **_session_kwargs())
+    tmx.add_argument("--name", default="")
+    tmx.set_defaults(func=cmd_tmux)
+
+    ap = sub.add_parser("agent-prompt",
+                        help="print a system-prompt snippet teaching agents to use agentbridge")
+    ap.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    ap.add_argument("--session", **_session_kwargs())
+    ap.set_defaults(func=cmd_agent_prompt)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except ValidationError as e:
+        print(f"validation error: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

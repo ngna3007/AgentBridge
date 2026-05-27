@@ -1,0 +1,9 @@
+.agent-bus/
+__pycache__/
+*.pyc
+/out/
+.DS_Store
+.claude/
+.idea/
+.vscode/
+*.swp
