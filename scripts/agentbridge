@@ -102,7 +102,7 @@ def lock_path(repo_relative_path: str) -> Path:
 
 # ----- Env defaults --------------------------------------------------------
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 ENV_IDENTITY = "AGENT_BRIDGE_IDENTITY"
 ENV_SESSION = "AGENT_BRIDGE_SESSION"
 
@@ -2039,44 +2039,128 @@ def _ansi(color: bool):
     return {k: "" for k in ("cyan", "yellow", "green", "red", "bold", "dim", "reset")}
 
 
+def _print_header(c: dict) -> None:
+    print()
+    print(f"  {c['bold']}{c['cyan']}AgentBridge {VERSION}{c['reset']}  "
+          f"{c['dim']}— local Claude↔Codex realtime bridge{c['reset']}")
+    print()
+
+
 def _print_welcome() -> None:
-    """Friendly first-run screen when invoked bare without a bus."""
+    """Non-interactive fallback when stdin is not a TTY (cannot prompt)."""
     c = _ansi(sys.stdout.isatty() and not os.environ.get("AGENT_BRIDGE_NO_COLOR"))
-    out = sys.stdout
+    _print_header(c)
+    print(f"  {c['yellow']}No bus found in this directory.{c['reset']}  "
+          f"{c['dim']}({bus_root()} does not exist){c['reset']}")
+    print()
+    print(f"  {c['bold']}Get started:{c['reset']}")
+    print()
+    print(f"    {c['green']}1.{c['reset']} {c['bold']}agentbridge init{c['reset']}"
+          f"                        {c['dim']}# bootstrap .agent-bus/ here{c['reset']}")
+    print(f"    {c['green']}2.{c['reset']} {c['bold']}export AGENT_BRIDGE_IDENTITY=claude{c['reset']}"
+          f"     {c['dim']}# or codex{c['reset']}")
+    print(f"    {c['green']}3.{c['reset']} {c['bold']}export AGENT_BRIDGE_SESSION=demo{c['reset']}"
+          f"        {c['dim']}# any session id{c['reset']}")
+    print(f"    {c['green']}4.{c['reset']} {c['bold']}agentbridge{c['reset']}"
+          f"                             {c['dim']}# opens the spectator TUI{c['reset']}")
+    print()
 
-    def line(s: str = "") -> None:
-        out.write(s + "\n")
 
-    line()
-    line(f"  {c['bold']}{c['cyan']}AgentBridge {VERSION}{c['reset']}  "
-         f"{c['dim']}— local Claude↔Codex realtime bridge{c['reset']}")
-    line()
-    line(f"  {c['yellow']}No bus found in this directory.{c['reset']}  "
-         f"{c['dim']}({bus_root()} does not exist){c['reset']}")
-    line()
-    line(f"  {c['bold']}Get started:{c['reset']}")
-    line()
-    line(f"    {c['green']}1.{c['reset']} {c['bold']}agentbridge init{c['reset']}"
-         f"                        {c['dim']}# bootstrap .agent-bus/ here{c['reset']}")
-    line(f"    {c['green']}2.{c['reset']} {c['bold']}export AGENT_BRIDGE_IDENTITY=claude{c['reset']}"
-         f"     {c['dim']}# or codex — pick a side{c['reset']}")
-    line(f"    {c['green']}3.{c['reset']} {c['bold']}export AGENT_BRIDGE_SESSION=demo{c['reset']}"
-         f"        {c['dim']}# any session id{c['reset']}")
-    line(f"    {c['green']}4.{c['reset']} {c['bold']}agentbridge{c['reset']}"
-         f"                             {c['dim']}# opens the spectator TUI{c['reset']}")
-    line()
-    line(f"  Other entry points:")
-    line(f"    {c['dim']}agentbridge --help              # full subcommand list{c['reset']}")
-    line(f"    {c['dim']}agentbridge agent-prompt        # system prompt for agents{c['reset']}")
-    line(f"    {c['dim']}agentbridge tmux                # 4-pane workspace (needs tmux){c['reset']}")
-    line()
+def _prompt(label: str, default: str, c: dict) -> str:
+    suffix = f" {c['dim']}[{default}]{c['reset']}" if default else ""
+    try:
+        v = input(f"  {label}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+    return v or default
+
+
+def _prompt_choice(label: str, options: list[str], default: str, c: dict) -> str:
+    opts = "/".join(o if o != default else o.upper() for o in options)
+    while True:
+        try:
+            v = input(f"  {label} ({opts}) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+        if not v:
+            return default
+        if v in options:
+            return v
+        for o in options:
+            if o.startswith(v):
+                return o
+        print(f"  {c['red']}choose one of: {', '.join(options)}{c['reset']}")
+
+
+def _run_onboarding() -> int:
+    """Interactive first-run wizard. Returns exit code; sets env vars on success."""
+    c = _ansi(sys.stdout.isatty() and not os.environ.get("AGENT_BRIDGE_NO_COLOR"))
+    _print_header(c)
+    print(f"  {c['yellow']}No bus found in {bus_root()}.{c['reset']}")
+    print(f"  Set one up here now? It will create {c['bold']}./.agent-bus/{c['reset']} "
+          f"in this directory.")
+    print()
+    yn = _prompt_choice("Initialize?", ["y", "n"], "y", c)
+    if yn != "y":
+        print()
+        print(f"  {c['dim']}Skipped. Run `agentbridge init` later, or `agentbridge --help` "
+              f"for the full command list.{c['reset']}")
+        return 0
+
+    print()
+    identity = _prompt_choice("Which side are you driving?", ["claude", "codex"],
+                              env_identity() or "claude", c)
+    if not identity:
+        return 0
+    session = _prompt("Session name", env_session() or "demo", c)
+    if not session:
+        return 0
+
+    # Run init silently — we print our own confirmation below.
+    import io
+    saved_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        rc = cmd_init(argparse.Namespace())
+    finally:
+        sys.stdout = saved_stdout
+    if rc != 0:
+        return rc
+
+    # Persist into this process so the TUI inherits the right defaults.
+    os.environ[ENV_IDENTITY] = identity
+    os.environ[ENV_SESSION] = session
+
+    print()
+    print(f"  {c['green']}✓{c['reset']} bus initialized at {c['bold']}{bus_root()}{c['reset']}")
+    print(f"  {c['green']}✓{c['reset']} identity = {c['bold']}{identity}{c['reset']}, "
+          f"session = {c['bold']}{session}{c['reset']}  "
+          f"{c['dim']}(this shell only){c['reset']}")
+    print()
+    print(f"  {c['dim']}To persist across shells, add to your rc file:{c['reset']}")
+    print(f"    {c['dim']}export AGENT_BRIDGE_IDENTITY={identity}{c['reset']}")
+    print(f"    {c['dim']}export AGENT_BRIDGE_SESSION={session}{c['reset']}")
+    print()
+    try:
+        input(f"  Press {c['bold']}Enter{c['reset']} to open the TUI… ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    return None  # signal: continue to launch TUI
 
 
 def main(argv: list[str] | None = None) -> int:
     effective = list(argv) if argv is not None else sys.argv[1:]
-    # Bare invocation on a TTY: launch TUI if bus exists, else welcome screen.
+    # Bare invocation on a TTY: launch TUI if bus exists, else onboarding wizard.
     if not effective and sys.stdout.isatty():
         if bus_root().exists():
+            effective = ["ui"]
+        elif sys.stdin.isatty():
+            rc = _run_onboarding()
+            if rc is not None:
+                return rc
             effective = ["ui"]
         else:
             _print_welcome()
