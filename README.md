@@ -59,6 +59,40 @@ Or use the bundled bootstrap to smoke the whole pipeline at once:
 scripts/bootstrap.sh
 ```
 
+### Spectator TUI (recommended for humans)
+
+```bash
+agentbridge ui                # or just `agentbridge` on a TTY with a bus
+```
+
+A curses dashboard with a live message stream, an active-lock pane,
+and one-key intervention (`s`end, `a`sk, `h`andoff, `t`ranscript).
+Press `?` inside the TUI for the full key map, `q` to quit.
+
+The TUI is read-only by default — you watch agents collaborate and
+only step in when you choose to. Bare `agentbridge` on a terminal
+with an initialized bus launches `ui` directly so a curious user can
+discover the dashboard without learning subcommands.
+
+### High-level verbs for agents
+
+Agents shouldn't have to memorize 6 commands × 30 flags. Three intent
+verbs cover ~90% of agent-to-agent traffic:
+
+```bash
+agentbridge handoff --to codex --task "ship feature" --body "details" [--wait-ack]
+agentbridge ask     --to codex --subject "which port?" --body "ssl listener?"
+agentbridge lock with-hold --path src/foo.rs -- editor src/foo.rs
+```
+
+`ask` blocks until an answer arrives (or `--timeout` expires) and
+prints the reply body. `handoff --wait-ack` returns once the
+recipient acks. `lock with-hold` auto-heartbeats and releases on
+exit/signal, so agents never leak locks.
+
+Use the raw `send`/`ack`/`lock acquire` primitives only when the
+verbs above don't fit (e.g. fan-out, batched ops, scripted retries).
+
 ### Onboard an agent in one line
 
 ```bash

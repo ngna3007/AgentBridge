@@ -819,11 +819,27 @@ export AGENT_BRIDGE_SESSION={session}
 - For ack-required messages, reply with:
   `{self_path} ack --reply-to <msg-id> --body "..."`
 
-## Sending
+## Sending (prefer these high-level verbs)
 
-- Hand off work or ask a question:
-  `{self_path} send --to {other} --type {{task|question|status|handoff|answer|warning|artifact}} --subject "..." --body "..." [--ack]`
+The three intent verbs cover ~90% of agent-to-agent traffic:
+
+- **Hand off a task** (with optional wait-for-ack):
+  `{self_path} handoff --to {other} --task "subject" --body "details" [--wait-ack]`
+  Returns the message id, or (with `--wait-ack`) blocks up to 300s
+  for the recipient's answer and prints a JSON summary.
+
+- **Ask a question and wait for an answer** (single call):
+  `{self_path} ask --to {other} --subject "..." --body "..."`
+  Blocks until the answer arrives, prints the answer body on stdout.
+  Add `--json` for the full reply object.
+
+- **Edit a file under a lock** (auto heartbeat + release):
+  `{self_path} lock with-hold --path <repo/relative/path> -- <your-editor-cmd>`
+
+Fall through to the lower-level primitives when you need them:
+- `{self_path} send --to {other} --type {{task|question|answer|handoff|status|artifact|warning}} --subject "..." --body "..." [--ack]`
 - For long bodies pipe stdin: `... --body-file -` and paste, end with Ctrl-D.
+- `{self_path} ack --reply-to <msg-id> --body "..."` to reply to an `--ack` message.
 
 ## Edit locks (REQUIRED before editing any file {other} might touch)
 
@@ -847,6 +863,139 @@ export AGENT_BRIDGE_SESSION={session}
 
 def cmd_version(args: argparse.Namespace) -> int:
     print(f"agentbridge {VERSION}")
+    return 0
+
+
+# ----- Composite verbs (Phase 7: agent-facing one-shot intents) -----------
+
+def _wait_for_reply(parent_id: str, agent: str, session: str,
+                    timeout_s: int, poll_ms: int = 200) -> dict | None:
+    """Block until a message with reply_to == parent_id (addressed to `agent`)
+    appears in messages.jsonl, or timeout expires. Returns the reply or None."""
+    deadline = time.monotonic() + max(timeout_s, 0)
+    seen_offset = msg_path().stat().st_size if msg_path().exists() else 0
+    while True:
+        for _, end, raw in _scan_new(msg_path(), seen_offset):
+            seen_offset = end
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("reply_to") != parent_id:
+                continue
+            if obj.get("to") != agent:
+                continue
+            if session and obj.get("session_id") != session:
+                continue
+            return obj
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll_ms / 1000.0)
+
+
+def cmd_handoff(args: argparse.Namespace) -> int:
+    """Send a task to the other agent. Optionally block until they ack.
+
+    Intent verb that bundles `send --type task [--ack]` + (optional)
+    poll for the answer reply. Designed so an agent issues one call
+    per handoff rather than orchestrating send + watch separately.
+    """
+    sender = require_identity(args, "from_agent")
+    session = require_session(args)
+    if sender == args.to:
+        raise ValidationError(f"handoff target must differ from sender ({sender})")
+
+    body = args.body or ""
+    if args.body_file:
+        body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+
+    wait = args.wait_ack
+    msg = {
+        "id": new_uuid(),
+        "ts": now_iso(),
+        "session_id": session,
+        "from": sender,
+        "to": args.to,
+        "type": "task",
+        "subject": args.task,
+        "body": body,
+        "requires_ack": wait,
+        "priority": args.priority,
+        "tags": (args.tag or []) + ["handoff"],
+    }
+    validate_message(msg)
+    atomic_append(msg_path(), msg)
+    emit_event("agentbridge", "send_completed", session, {
+        "msg_id": msg["id"], "from": sender, "to": args.to, "type": "task",
+    })
+
+    if not wait:
+        print(msg["id"])
+        return 0
+
+    if sys.stderr.isatty():
+        print(f"handoff → {args.to} (waiting up to {args.timeout}s for ack)",
+              file=sys.stderr)
+    reply = _wait_for_reply(msg["id"], sender, session, args.timeout)
+    if reply is None:
+        print(f"error: no ack from {args.to} within {args.timeout}s "
+              f"(msg_id={msg['id']})", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "handoff_id": msg["id"],
+        "ack_id": reply["id"],
+        "ack_from": reply["from"],
+        "ack_body": reply.get("body", ""),
+    }, indent=2))
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Send a question and block until an answer arrives (or timeout).
+
+    Single-call request/response. Returns the answer body on stdout
+    so an agent can capture it directly without polling watch.
+    """
+    sender = require_identity(args, "from_agent")
+    session = require_session(args)
+    if sender == args.to:
+        raise ValidationError(f"ask target must differ from sender ({sender})")
+
+    body = args.body or ""
+    if args.body_file:
+        body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+
+    msg = {
+        "id": new_uuid(),
+        "ts": now_iso(),
+        "session_id": session,
+        "from": sender,
+        "to": args.to,
+        "type": "question",
+        "subject": args.subject,
+        "body": body,
+        "requires_ack": True,
+        "priority": args.priority,
+        "tags": args.tag or [],
+    }
+    validate_message(msg)
+    atomic_append(msg_path(), msg)
+    emit_event("agentbridge", "send_completed", session, {
+        "msg_id": msg["id"], "from": sender, "to": args.to, "type": "question",
+    })
+
+    if sys.stderr.isatty():
+        print(f"ask → {args.to} (waiting up to {args.timeout}s)",
+              file=sys.stderr)
+    reply = _wait_for_reply(msg["id"], sender, session, args.timeout)
+    if reply is None:
+        print(f"error: no answer from {args.to} within {args.timeout}s "
+              f"(msg_id={msg['id']})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(reply, indent=2))
+    else:
+        print(reply.get("body", ""))
     return 0
 
 
@@ -1207,6 +1356,457 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----- Interactive TUI -----------------------------------------------------
+
+def _fmt_msg_row(obj: dict) -> str:
+    """One-line summary of a message for the live stream pane."""
+    ts = obj.get("ts", "")[11:19]
+    arrow = f"{obj.get('from', '?')}→{obj.get('to', '?')}"
+    typ = obj.get("type", "?")
+    subj = obj.get("subject", "")
+    if len(subj) > 80:
+        subj = subj[:77] + "..."
+    ack = " [ack]" if obj.get("requires_ack") else ""
+    return f"{ts}  {arrow:<14}  {typ:<8} {subj}{ack}"
+
+
+def _fmt_lock_row(body: dict) -> tuple[str, str]:
+    """Two-line summary of an active lock: (path-line, meta-line)."""
+    stale = _lock_is_stale(body)
+    age = ""
+    try:
+        hb = parse_iso(body["heartbeat_at"])
+        secs = int((datetime.now(timezone.utc) - hb).total_seconds())
+        age = f"{secs}s"
+    except (KeyError, ValueError):
+        pass
+    path = body.get("path", "?")
+    meta = f"  by {body.get('owner','?'):<6} ttl={body.get('ttl_seconds','?')}s age={age}"
+    if stale:
+        meta += "  STALE"
+    return path, meta
+
+
+def _read_active_locks() -> list[dict]:
+    out: list[dict] = []
+    d = locks_dir()
+    if not d.exists():
+        return out
+    for p in sorted(d.glob("*.lock")):
+        body = _read_lock(p)
+        if body:
+            out.append(body)
+    return out
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    """Curses spectator: live message stream + active locks; menu keys for sending."""
+    try:
+        import curses
+    except ImportError:
+        print("error: curses not available on this platform", file=sys.stderr)
+        return 1
+
+    if not bus_root().exists():
+        print(f"error: bus not initialized at {bus_root()}. Run: agentbridge init",
+              file=sys.stderr)
+        return 1
+
+    # Pre-resolve identity/session (lenient — TUI shows them, doesn't enforce).
+    me = getattr(args, "as_agent", None) or env_identity() or ""
+    session = getattr(args, "session", None) or env_session() or ""
+
+    import collections
+    import threading
+
+    msgs: collections.deque[dict] = collections.deque(maxlen=500)
+    msg_lock = threading.Lock()
+    stop = threading.Event()
+    paused = {"v": False}
+    status_msg = {"v": "ready — press ? for keys"}
+
+    # Seed with existing messages (tail)
+    if msg_path().exists():
+        offset = 0
+        for _start, end, raw in _scan_new(msg_path(), 0):
+            try:
+                obj = json.loads(raw)
+                msgs.append(obj)
+                offset = end
+            except json.JSONDecodeError:
+                offset = end
+        cur_offset = offset
+    else:
+        cur_offset = 0
+
+    def tail_thread():
+        nonlocal cur_offset
+        while not stop.is_set():
+            if not paused["v"] and msg_path().exists():
+                for _s, end, raw in _scan_new(msg_path(), cur_offset):
+                    try:
+                        obj = json.loads(raw)
+                        with msg_lock:
+                            msgs.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    cur_offset = end
+            time.sleep(0.25)
+
+    t = threading.Thread(target=tail_thread, daemon=True)
+    t.start()
+
+    def draw(stdscr) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(3, curses.COLOR_GREEN, -1)
+            curses.init_pair(4, curses.COLOR_RED, -1)
+            curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+        except curses.error:
+            pass
+
+        scroll = {"v": 0}  # offset from tail
+
+        while not stop.is_set():
+            try:
+                stdscr.erase()
+                h, w = stdscr.getmaxyx()
+                if h < 10 or w < 60:
+                    stdscr.addnstr(0, 0, "terminal too small (need >= 60x10)", w - 1)
+                    stdscr.refresh()
+                    time.sleep(0.2)
+                    continue
+
+                # Header
+                ident_disp = me or "(unset)"
+                sess_disp = session or "(unset)"
+                hdr = (f" AgentBridge {VERSION}  bus={bus_root()}  "
+                       f"me={ident_disp}  session={sess_disp}")
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addnstr(0, 0, hdr.ljust(w), w - 1)
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+                # Layout: messages | locks
+                body_h = h - 3
+                msg_w = max(40, (w * 2) // 3)
+                lock_w = w - msg_w - 1
+
+                # Messages pane
+                stdscr.attron(curses.A_BOLD)
+                pause_tag = "  [PAUSED]" if paused["v"] else ""
+                stdscr.addnstr(1, 0, f" Messages (live){pause_tag}".ljust(msg_w), msg_w)
+                stdscr.attroff(curses.A_BOLD)
+
+                with msg_lock:
+                    items = list(msgs)
+                max_rows = body_h - 1
+                # Scroll: 0 = show last `max_rows`. Positive = look back.
+                end_idx = max(0, len(items) - scroll["v"])
+                start_idx = max(0, end_idx - max_rows)
+                visible = items[start_idx:end_idx]
+                for i, obj in enumerate(visible):
+                    row = 2 + i
+                    line = _fmt_msg_row(obj)
+                    pair = 0
+                    typ = obj.get("type", "")
+                    if typ == "task":
+                        pair = curses.color_pair(2)
+                    elif typ == "question":
+                        pair = curses.color_pair(5)
+                    elif typ == "answer":
+                        pair = curses.color_pair(3)
+                    elif typ == "warning":
+                        pair = curses.color_pair(4)
+                    if pair:
+                        stdscr.attron(pair)
+                    stdscr.addnstr(row, 0, line.ljust(msg_w), msg_w)
+                    if pair:
+                        stdscr.attroff(pair)
+
+                # Vertical separator
+                for r in range(1, body_h + 1):
+                    try:
+                        stdscr.addch(r, msg_w, curses.ACS_VLINE)
+                    except curses.error:
+                        pass
+
+                # Locks pane
+                stdscr.attron(curses.A_BOLD)
+                stdscr.addnstr(1, msg_w + 1, " Active Locks".ljust(lock_w - 1), lock_w - 1)
+                stdscr.attroff(curses.A_BOLD)
+
+                locks = _read_active_locks()
+                row = 2
+                if not locks:
+                    stdscr.addnstr(row, msg_w + 1, "  (none)".ljust(lock_w - 1), lock_w - 1)
+                else:
+                    for body in locks:
+                        if row >= body_h:
+                            break
+                        path, meta = _fmt_lock_row(body)
+                        stdscr.addnstr(row, msg_w + 1, ("  " + path).ljust(lock_w - 1),
+                                       lock_w - 1)
+                        row += 1
+                        if row < body_h:
+                            stdscr.addnstr(row, msg_w + 1, meta.ljust(lock_w - 1),
+                                           lock_w - 1)
+                            row += 1
+
+                # Status line + key hints
+                sb = f" {status_msg['v']}"
+                stdscr.attron(curses.color_pair(1))
+                stdscr.addnstr(h - 2, 0, sb.ljust(w), w - 1)
+                stdscr.attroff(curses.color_pair(1))
+
+                hints = ("  [s]end  [a]sk  [h]andoff  [t]ranscript  "
+                         "[j/k] scroll  [p]ause  [r]efresh  [?] help  [q]uit")
+                stdscr.attron(curses.A_REVERSE)
+                stdscr.addnstr(h - 1, 0, hints.ljust(w), w - 1)
+                stdscr.attroff(curses.A_REVERSE)
+                stdscr.refresh()
+            except curses.error:
+                pass
+
+            # Input poll (250ms)
+            stdscr.timeout(250)
+            try:
+                ch = stdscr.getch()
+            except curses.error:
+                ch = -1
+            if ch == -1:
+                continue
+
+            if ch in (ord("q"), 27):  # q or ESC
+                stop.set()
+                return
+            elif ch == ord("p"):
+                paused["v"] = not paused["v"]
+                status_msg["v"] = "paused" if paused["v"] else "resumed"
+            elif ch == ord("j") or ch == curses.KEY_DOWN:
+                scroll["v"] = max(0, scroll["v"] - 1)
+            elif ch == ord("k") or ch == curses.KEY_UP:
+                scroll["v"] = min(len(msgs), scroll["v"] + 1)
+            elif ch == ord("g"):
+                scroll["v"] = len(msgs)
+            elif ch == ord("G"):
+                scroll["v"] = 0
+            elif ch == ord("r"):
+                status_msg["v"] = "refreshed"
+            elif ch == ord("?"):
+                _ui_help_modal(stdscr)
+            elif ch == ord("s"):
+                _ui_send_modal(stdscr, "send", me, session, status_msg)
+            elif ch == ord("a"):
+                _ui_send_modal(stdscr, "ask", me, session, status_msg)
+            elif ch == ord("h"):
+                _ui_send_modal(stdscr, "handoff", me, session, status_msg)
+            elif ch == ord("t"):
+                _ui_transcript_modal(stdscr, session)
+
+    try:
+        curses.wrapper(draw)
+    finally:
+        stop.set()
+    return 0
+
+
+def _ui_prompt(stdscr, prompt: str, default: str = "") -> str | None:
+    """Bottom-line text prompt. Returns None on ESC."""
+    import curses
+    h, w = stdscr.getmaxyx()
+    win = curses.newwin(1, w, h - 1, 0)
+    win.clear()
+    win.addnstr(0, 0, prompt[: w - 2], w - 1, curses.A_REVERSE)
+    win.refresh()
+    curses.echo()
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    try:
+        # Inline edit area
+        ed_y = h - 1
+        ed_x = min(len(prompt) + 1, w - 2)
+        edwin = curses.newwin(1, w - ed_x - 1, ed_y, ed_x)
+        edwin.addstr(0, 0, default)
+        edwin.refresh()
+        buf = list(default)
+        while True:
+            ch = stdscr.getch()
+            if ch in (10, 13):  # Enter
+                return "".join(buf)
+            elif ch == 27:  # ESC
+                return None
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                if buf:
+                    buf.pop()
+            elif 32 <= ch < 127:
+                buf.append(chr(ch))
+            edwin.clear()
+            edwin.addnstr(0, 0, "".join(buf), w - ed_x - 2)
+            edwin.refresh()
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+
+
+def _ui_send_modal(stdscr, kind: str, me: str, session: str, status_msg: dict) -> None:
+    """Open form for send/ask/handoff. kind in {'send','ask','handoff'}."""
+    if not me:
+        status_msg["v"] = "no identity set (export AGENT_BRIDGE_IDENTITY or pass --as)"
+        return
+    if not session:
+        status_msg["v"] = "no session set (export AGENT_BRIDGE_SESSION or pass --session)"
+        return
+
+    other = "codex" if me == "claude" else "claude"
+    to = _ui_prompt(stdscr, f" to [{other}]:", other)
+    if to is None:
+        status_msg["v"] = f"{kind} cancelled"
+        return
+    if not to:
+        to = other
+    if to not in AGENT_ENUM:
+        status_msg["v"] = f"invalid recipient {to!r}"
+        return
+
+    subj_prompt = " task:" if kind == "handoff" else " subject:"
+    subject = _ui_prompt(stdscr, subj_prompt, "")
+    if subject is None or not subject.strip():
+        status_msg["v"] = f"{kind} cancelled"
+        return
+
+    body = _ui_prompt(stdscr, " body:", "")
+    if body is None:
+        body = ""
+
+    kind_to_type = {"send": "status", "ask": "question", "handoff": "task"}
+    if kind not in kind_to_type:
+        status_msg["v"] = f"unknown kind {kind!r}"
+        return
+    try:
+        if me == to:
+            raise ValidationError(f"self-message refused: from and to are both {me!r}")
+        msg = {
+            "id": new_uuid(),
+            "ts": now_iso(),
+            "session_id": session,
+            "from": me,
+            "to": to,
+            "type": kind_to_type[kind],
+            "subject": subject,
+            "body": body,
+            "requires_ack": kind == "ask",
+            "priority": "normal",
+            "tags": ["ui", kind],
+        }
+        validate_message(msg)
+        atomic_append(msg_path(), msg)
+        emit_event("agentbridge", f"send_completed", session, {
+            "msg_id": msg["id"], "from": me, "to": to, "type": msg["type"],
+        })
+        status_msg["v"] = f"{kind} sent → {msg['id'][:8]}"
+    except (ValidationError, OSError) as e:
+        status_msg["v"] = f"{kind} failed: {e}"
+
+
+def _ui_transcript_modal(stdscr, session: str) -> None:
+    """Pop up a scrollable transcript of the current session."""
+    import curses
+    h, w = stdscr.getmaxyx()
+    win = curses.newwin(h - 2, w, 1, 0)
+    win.box()
+    win.addstr(0, 2, " Transcript (PgUp/PgDn, q to close) ")
+
+    entries: list[tuple[str, int, int, str, dict]] = []
+    for off, m in _iter_jsonl_with_offset(msg_path()):
+        if session and m.get("session_id") != session:
+            continue
+        entries.append((m.get("ts", ""), 0, off, "msg", m))
+    for off, e in _iter_jsonl_with_offset(evt_path()):
+        if session and e.get("session_id") != session:
+            continue
+        entries.append((e.get("ts", ""), 1, off, "evt", e))
+    entries.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    lines: list[str] = []
+    for ts, _r, _o, kind, obj in entries:
+        ts_short = ts[11:19] if len(ts) > 19 else ts
+        if kind == "msg":
+            lines.append(f"{ts_short}  msg  {obj.get('from','?')}→{obj.get('to','?')}  "
+                         f"{obj.get('type','?'):<8} {obj.get('subject','')}")
+        else:
+            lines.append(f"{ts_short}  evt  {obj.get('actor','?')}  {obj.get('event','?')}")
+
+    pos = max(0, len(lines) - (h - 4))
+    while True:
+        win.erase()
+        win.box()
+        win.addnstr(0, 2, f" Transcript: session={session or '(any)'} "
+                          f" ({len(lines)} entries) — q to close ", w - 4)
+        visible = lines[pos:pos + (h - 4)]
+        for i, ln in enumerate(visible):
+            try:
+                win.addnstr(1 + i, 1, ln, w - 3)
+            except curses.error:
+                pass
+        win.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), 27, ord("t")):
+            break
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            pos = min(max(0, len(lines) - 1), pos + 1)
+        elif ch in (curses.KEY_UP, ord("k")):
+            pos = max(0, pos - 1)
+        elif ch == curses.KEY_NPAGE:
+            pos = min(max(0, len(lines) - 1), pos + (h - 4))
+        elif ch == curses.KEY_PPAGE:
+            pos = max(0, pos - (h - 4))
+
+
+def _ui_help_modal(stdscr) -> None:
+    import curses
+    h, w = stdscr.getmaxyx()
+    hh, ww = min(20, h - 2), min(70, w - 4)
+    win = curses.newwin(hh, ww, (h - hh) // 2, (w - ww) // 2)
+    win.box()
+    text = [
+        "  AgentBridge TUI — keys",
+        "",
+        "  s   send a status message (free-form)",
+        "  a   ask a question (recipient must reply)",
+        "  h   hand off a task",
+        "  t   open transcript modal",
+        "  j   scroll messages down (newer)",
+        "  k   scroll messages up (older)",
+        "  g   jump to oldest",
+        "  G   jump to newest (tail)",
+        "  p   pause/resume live tail",
+        "  r   force refresh",
+        "  ?   this help",
+        "  q   quit (ESC also works)",
+        "",
+        "  All actions write to .agent-bus/ in cwd.",
+        "  Press any key to close.",
+    ]
+    for i, line in enumerate(text):
+        if i + 1 >= hh - 1:
+            break
+        try:
+            win.addnstr(1 + i, 1, line, ww - 2)
+        except curses.error:
+            pass
+    win.refresh()
+    stdscr.nodelay(False)
+    stdscr.getch()
+    stdscr.nodelay(True)
+
+
 # ----- argparse ------------------------------------------------------------
 
 def _identity_kwargs(env_var: str):
@@ -1232,6 +1832,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="bootstrap .agent-bus/").set_defaults(func=cmd_init)
     sub.add_parser("version", help="print version").set_defaults(func=cmd_version)
     sub.add_parser("status", help="show bus health").set_defaults(func=cmd_status)
+
+    # ---- ui (interactive spectator) ----
+    ui_p = sub.add_parser("ui", help="interactive spectator TUI (curses)")
+    ui_p.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY),
+                      help="identity to act as when sending from TUI")
+    ui_p.add_argument("--session", **_session_kwargs())
+    ui_p.set_defaults(func=cmd_ui)
 
     # ---- send ----
     s = sub.add_parser("send", help="send a message")
@@ -1363,6 +1970,41 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--session", **_session_kwargs())
     ap.set_defaults(func=cmd_agent_prompt)
 
+    # ---- composite verbs: handoff, ask ----
+    ho = sub.add_parser("handoff",
+                        help="send a task to the other agent (optionally wait for ack)")
+    ho.add_argument("--from", dest="from_agent", **_identity_kwargs(ENV_IDENTITY),
+                    help="sender (default: $AGENT_BRIDGE_IDENTITY)")
+    ho.add_argument("--to", required=True, choices=sorted(AGENT_ENUM))
+    ho.add_argument("--task", required=True, help="short task subject")
+    ho.add_argument("--body", default="")
+    ho.add_argument("--body-file", default=None,
+                    help="read body from FILE (or '-' for stdin)")
+    ho.add_argument("--session", **_session_kwargs())
+    ho.add_argument("--priority", default="normal", choices=sorted(PRIORITY_ENUM))
+    ho.add_argument("--tag", action="append", default=[])
+    ho.add_argument("--wait-ack", action="store_true",
+                    help="block until recipient acks (else return msg-id and exit)")
+    ho.add_argument("--timeout", type=int, default=300,
+                    help="max seconds to wait for ack (default 300)")
+    ho.set_defaults(func=cmd_handoff)
+
+    aq = sub.add_parser("ask",
+                        help="send a question and block until answered")
+    aq.add_argument("--from", dest="from_agent", **_identity_kwargs(ENV_IDENTITY))
+    aq.add_argument("--to", required=True, choices=sorted(AGENT_ENUM))
+    aq.add_argument("--subject", required=True)
+    aq.add_argument("--body", default="")
+    aq.add_argument("--body-file", default=None)
+    aq.add_argument("--session", **_session_kwargs())
+    aq.add_argument("--priority", default="normal", choices=sorted(PRIORITY_ENUM))
+    aq.add_argument("--tag", action="append", default=[])
+    aq.add_argument("--timeout", type=int, default=300,
+                    help="max seconds to wait for answer (default 300)")
+    aq.add_argument("--json", action="store_true",
+                    help="print full answer JSON instead of body only")
+    aq.set_defaults(func=cmd_ask)
+
     # ---- completion ----
     comp = sub.add_parser("completion",
                           help="emit a bash or zsh completion script")
@@ -1388,8 +2030,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    effective = list(argv) if argv is not None else sys.argv[1:]
+    # Default to interactive TUI when invoked bare on a terminal with a bus.
+    if not effective and sys.stdout.isatty() and bus_root().exists():
+        effective = ["ui"]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(effective)
     try:
         return args.func(args)
     except ValidationError as e:
