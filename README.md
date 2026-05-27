@@ -20,16 +20,29 @@ and [`Plans.md`](Plans.md) for the build plan and acceptance mapping.
 
 ## Install
 
-No dependencies beyond Python 3.9+ and `tmux` (only for the tmux helper).
-
 ```bash
-git clone <this-repo> AgentBridge
-cd AgentBridge
-make install           # symlinks scripts/agentbridge into /usr/local/bin
+npm i -g @rowanng/agentbridge
 ```
 
-Or run directly without installing — every command works from
-`scripts/agentbridge` in the repo.
+That's it. Puts the `agentbridge` binary on your PATH. The script is
+pure Python (3.9+) and stdlib-only; npm is just the distribution
+channel. `tmux` is optional and only needed if you use the `tmux`
+subcommand.
+
+Platforms: Linux, macOS, WSL. Native Windows is not supported — the
+bus relies on `fcntl.flock` and the TUI on curses.
+
+<details>
+<summary>Run from source (contributors)</summary>
+
+```bash
+git clone https://github.com/ngna3007/AgentBridge.git
+cd AgentBridge
+./scripts/agentbridge --help     # no install step needed
+# optional: make install         # symlinks into /usr/local/bin
+```
+
+</details>
 
 ## Quickstart
 
