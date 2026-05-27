@@ -120,8 +120,10 @@ fi
 "$AB" lock release --as codex --path src/conflict.py --session eng-env >/dev/null
 
 # ---- lock with-hold auto heartbeat + release ----
+# ttl=3 → heartbeat interval = max(1, 3//3) = 1s. Sleep 2.2s so at
+# least one heartbeat fires before the inner command exits.
 "$AB" lock with-hold --as claude --path src/auto.py --ttl 3 --session eng-env \
-  -- bash -c "sleep 1; echo OK" > "$WORKDIR/wh.out"
+  -- bash -c "sleep 2.2; echo OK" > "$WORKDIR/wh.out"
 assert_contains "$(cat $WORKDIR/wh.out)" "OK" "with-hold runs inner command"
 # lock file should be gone after exit
 if [[ -f .agent-bus/locks/src__auto.py.lock ]]; then
@@ -131,8 +133,10 @@ else
 fi
 # verify heartbeat event(s) emitted during hold
 hb_count=$(grep -c '"event":"lock_heartbeat"' .agent-bus/events.jsonl || true)
-if (( hb_count >= 0 )); then
-  pass "with-hold heartbeat thread ran (count=$hb_count)"
+if (( hb_count >= 1 )); then
+  pass "with-hold heartbeat thread fired (count=$hb_count)"
+else
+  fail "with-hold heartbeat thread did NOT fire (count=$hb_count)"
 fi
 
 # ---- with-hold release on signal ----

@@ -293,6 +293,7 @@ def emit_event(actor: str, event: str, session_id: str, meta: dict | None = None
 
 def cmd_init(args: argparse.Namespace) -> int:
     root = bus_root()
+    already = root.exists() and msg_path().exists() and msg_path().stat().st_size > 0
     for d in (root, locks_dir(), state_dir(), sessions_dir()):
         d.mkdir(parents=True, exist_ok=True)
     for f in (msg_path(), evt_path()):
@@ -302,6 +303,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         os.chmod(p, 0o700)
     for f in (msg_path(), evt_path()):
         os.chmod(f, 0o600)
+    if already:
+        print(f"bus already initialized at {root} (perms refreshed, data preserved)")
+        return 0
     print(f"initialized bus at {root}")
     if sys.stdout.isatty():
         print()
@@ -352,6 +356,11 @@ def cmd_send(args: argparse.Namespace) -> int:
     if args.artifact:
         msg["artifacts"] = [_parse_artifact(a) for a in args.artifact]
     validate_message(msg)
+    if args.dry_run:
+        # Print the validated payload without committing. Useful for
+        # agents previewing structured messages before send.
+        print(json.dumps(msg, indent=2, ensure_ascii=False))
+        return 0
     atomic_append(msg_path(), msg)
     emit_event("agentbridge", "send_completed", session, {
         "msg_id": msg["id"], "from": msg["from"], "to": msg["to"], "type": msg["type"],
@@ -841,6 +850,131 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+_BASH_COMPLETION = r"""# agentbridge bash completion
+# Install: agentbridge completion bash > ~/.local/share/bash-completion/completions/agentbridge
+_agentbridge() {
+    local cur prev words cword
+    _init_completion || return
+
+    local top="init version status send watch ack inbox lock transcript tmux agent-prompt cursor completion"
+    local lock_sub="acquire heartbeat release reap key with-hold"
+    local cursor_sub="show reset"
+    local agents="claude codex"
+    local types="task question answer handoff status artifact warning"
+    local priorities="low normal high"
+
+    if (( cword == 1 )); then
+        COMPREPLY=( $(compgen -W "$top" -- "$cur") )
+        return
+    fi
+
+    case "${words[1]}" in
+        lock)
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -W "$lock_sub" -- "$cur") ); return
+            fi ;;
+        cursor)
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -W "$cursor_sub" -- "$cur") ); return
+            fi ;;
+        completion)
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") ); return
+            fi ;;
+    esac
+
+    case "$prev" in
+        --as|--from|--to)  COMPREPLY=( $(compgen -W "$agents" -- "$cur") ); return ;;
+        --type)            COMPREPLY=( $(compgen -W "$types" -- "$cur") ); return ;;
+        --priority)        COMPREPLY=( $(compgen -W "$priorities" -- "$cur") ); return ;;
+        --format)          COMPREPLY=( $(compgen -W "pretty jsonl" -- "$cur") ); return ;;
+        --body-file|--path) _filedir; return ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        local flags="--as --from --to --type --subject --body --body-file --session \
+                     --ack --reply-to --priority --tag --artifact --dry-run \
+                     --once --pretty --json --bell --interval \
+                     --path --ttl --reason --wait --force --force-stale --window \
+                     --name --format --unread --needs-ack --to --help"
+        COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+    fi
+}
+complete -F _agentbridge agentbridge
+"""
+
+_ZSH_COMPLETION = r"""#compdef agentbridge
+# agentbridge zsh completion
+# Install: agentbridge completion zsh > "${fpath[1]}/_agentbridge" && compinit
+_agentbridge() {
+    local -a top lock_sub cursor_sub
+    top=(init version status send watch ack inbox lock transcript tmux agent-prompt cursor completion)
+    lock_sub=(acquire heartbeat release reap key with-hold)
+    cursor_sub=(show reset)
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' top
+        return
+    fi
+    case "$words[2]" in
+        lock)       (( CURRENT == 3 )) && { _describe 'lock subcommand' lock_sub; return } ;;
+        cursor)     (( CURRENT == 3 )) && { _describe 'cursor subcommand' cursor_sub; return } ;;
+        completion) (( CURRENT == 3 )) && { _values 'shell' bash zsh; return } ;;
+    esac
+    _arguments \
+        '--as=[identity]:agent:(claude codex)' \
+        '--from=[sender]:agent:(claude codex)' \
+        '--to=[recipient]:agent:(claude codex)' \
+        '--type=[message type]:type:(task question answer handoff status artifact warning)' \
+        '--priority=[priority]:priority:(low normal high)' \
+        '--format=[transcript format]:format:(pretty jsonl)' \
+        '--body-file=[body file]:file:_files' \
+        '--path=[repo-relative path]:file:_files' \
+        '*:: :->args'
+}
+_agentbridge "$@"
+"""
+
+
+def cmd_completion(args: argparse.Namespace) -> int:
+    if args.shell == "bash":
+        sys.stdout.write(_BASH_COMPLETION)
+    else:
+        sys.stdout.write(_ZSH_COMPLETION)
+    return 0
+
+
+def cmd_cursor_show(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    off = _read_cursor(agent)
+    p = cursor_path(agent)
+    exists = p.exists()
+    msg_size = msg_path().stat().st_size if msg_path().exists() else 0
+    print(f"cursor: {p}")
+    print(f"agent: {agent}")
+    print(f"offset: {off}")
+    print(f"file present: {exists}")
+    print(f"messages.jsonl size: {msg_size}  ({max(0, msg_size - off)} bytes unscanned)")
+    return 0
+
+
+def cmd_cursor_reset(args: argparse.Namespace) -> int:
+    agent = require_identity(args, "as_agent")
+    p = cursor_path(agent)
+    if not p.exists():
+        print(f"no cursor for {agent} (already absent)")
+        return 0
+    if args.to is not None:
+        if args.to < 0:
+            raise ValidationError(f"--to must be >= 0, got {args.to}")
+        _write_cursor(agent, args.to)
+        print(f"cursor for {agent} set to offset {args.to}")
+    else:
+        p.unlink()
+        print(f"cursor for {agent} removed (next watch starts from offset 0)")
+    return 0
+
+
 # ----- Pretty rendering ----------------------------------------------------
 
 def _color(enabled: bool):
@@ -909,6 +1043,25 @@ def _iter_jsonl(path: Path) -> Iterable[dict]:
                 continue
 
 
+def _iter_jsonl_with_offset(path: Path) -> Iterable[tuple[int, dict]]:
+    """Yield (byte_offset, parsed_obj) for each well-formed JSONL line."""
+    if not path.exists():
+        return
+    with open(path, "rb") as f:
+        while True:
+            off = f.tell()
+            raw = f.readline()
+            if not raw:
+                break
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                yield off, json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+
+
 def _iter_messages() -> Iterable[dict]:
     return _iter_jsonl(msg_path())
 
@@ -949,16 +1102,20 @@ def _find_override_warning(reaper: str, owner: str, lkey: str, window_s: int) ->
 
 def cmd_transcript(args: argparse.Namespace) -> int:
     session = args.session
-    entries: list[tuple[str, str, dict]] = []
-    for m in _iter_messages():
+    # Sort key: (ts, kind_rank, byte_offset). Messages and events come
+    # from separate files, so byte offsets aren't comparable across them;
+    # break inter-file ties via kind_rank (msg < evt) for determinism.
+    entries: list[tuple[str, int, int, str, dict]] = []
+    for off, m in _iter_jsonl_with_offset(msg_path()):
         if session and m.get("session_id") != session:
             continue
-        entries.append((m["ts"], "msg", m))
-    for e in _iter_events():
+        entries.append((m["ts"], 0, off, "msg", m))
+    for off, e in _iter_jsonl_with_offset(evt_path()):
         if session and e.get("session_id") != session:
             continue
-        entries.append((e["ts"], "evt", e))
-    entries.sort(key=lambda x: x[0])
+        entries.append((e["ts"], 1, off, "evt", e))
+    entries.sort(key=lambda x: (x[0], x[1], x[2]))
+    entries = [(ts, kind, obj) for ts, _, _, kind, obj in entries]
 
     if args.format == "jsonl":
         for ts, kind, obj in entries:
@@ -1025,6 +1182,13 @@ def cmd_tmux(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     root = bus_root()
     print(f"bus: {root}  (exists={root.exists()})")
+    ident = env_identity() or os.environ.get(ENV_IDENTITY) or "unset"
+    sess = env_session() or "unset"
+    raw_ident = os.environ.get(ENV_IDENTITY)
+    if raw_ident and raw_ident not in AGENT_ENUM:
+        ident = f"{raw_ident!r} (invalid — must be {'|'.join(sorted(AGENT_ENUM))})"
+    print(f"{ENV_IDENTITY}: {ident}")
+    print(f"{ENV_SESSION}: {sess}")
     if not root.exists():
         return 0
     mc = sum(1 for _ in _iter_messages())
@@ -1088,6 +1252,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tag", action="append", default=[])
     s.add_argument("--artifact", action="append", default=[],
                    help="kind=file,ref=path/to/x[,sha256=...]")
+    s.add_argument("--dry-run", action="store_true",
+                   help="validate + print the message JSON without committing")
     s.set_defaults(func=cmd_send)
 
     # ---- watch ----
@@ -1196,6 +1362,27 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
     ap.add_argument("--session", **_session_kwargs())
     ap.set_defaults(func=cmd_agent_prompt)
+
+    # ---- completion ----
+    comp = sub.add_parser("completion",
+                          help="emit a bash or zsh completion script")
+    comp.add_argument("shell", choices=["bash", "zsh"])
+    comp.set_defaults(func=cmd_completion)
+
+    # ---- cursor {show, reset} ----
+    cur = sub.add_parser("cursor", help="inspect/reset per-agent watch cursor")
+    cursub = cur.add_subparsers(dest="cursor_cmd", required=True)
+
+    cs = cursub.add_parser("show", help="print cursor offset for an agent")
+    cs.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    cs.set_defaults(func=cmd_cursor_show)
+
+    cr = cursub.add_parser("reset",
+                           help="reset cursor to a specific offset (default: remove file → 0)")
+    cr.add_argument("--as", dest="as_agent", **_identity_kwargs(ENV_IDENTITY))
+    cr.add_argument("--to", type=int, default=None,
+                    help="set cursor to N bytes (omit to remove the cursor file)")
+    cr.set_defaults(func=cmd_cursor_reset)
 
     return p
 

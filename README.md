@@ -226,6 +226,37 @@ its examples so the prompt is pre-personalized.
 ### `version`
 Prints `agentbridge <semver>` and exits 0.
 
+### `cursor`
+```
+cursor show  [--as <agent>]
+cursor reset [--as <agent>] [--to <byte-offset>]
+```
+Inspect or reset the per-agent watch cursor. `reset` without `--to`
+removes the cursor file (next `watch`/`inbox --unread` starts from
+offset 0). Useful after manually trimming `messages.jsonl` or if a
+cursor desyncs.
+
+### `completion`
+```
+completion {bash|zsh}
+```
+Emits a self-contained completion script.
+```bash
+# bash
+agentbridge completion bash > ~/.local/share/bash-completion/completions/agentbridge
+# zsh
+agentbridge completion zsh > "${fpath[1]}/_agentbridge" && compinit
+```
+Tab-completes top-level commands, `lock`/`cursor` subcommands, agent
+names, message types, priorities, and file paths.
+
+### Dry-run send
+
+`send --dry-run` validates and prints the message JSON without
+appending it to `messages.jsonl` or emitting `send_completed`. Use it
+when composing complex payloads from inside an agent before
+committing.
+
 ---
 
 ## Message schema
@@ -274,6 +305,13 @@ Prints `agentbridge <semver>` and exits 0.
 | Lock owner crashed          | Heartbeat ages out; other agent runs `lock reap`                           |
 | Non-stale lock contention   | Owner-priority: requester sends `question`+`requires_ack`, owner responds  |
 | Emergency override          | Reaper must first send `warning` msg tagged `override:<key>`, then `--force-stale` |
+
+**Filesystem requirement:** the bus directory must live on a local
+POSIX filesystem. Atomic-append relies on `fcntl.flock()` and `O_APPEND`
+semantics that are not honored consistently on NFS or SMB shares —
+running the bus across a network mount can produce torn lines and
+lock corruption. Use a local path (default `./.agent-bus/`) or a
+tmpfs / btrfs / ext4 / apfs / xfs volume.
 
 ---
 
