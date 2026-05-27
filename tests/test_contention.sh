@@ -64,9 +64,10 @@ else
 fi
 
 # Send warning msg w/ correct tag, then override succeeds.
+target_key=$("$AB" lock key "$target")
 "$AB" send --from codex --to claude --type warning \
   --subject "emergency override" --body "claude crashed; reaping lock" \
-  --session eng-conflict --tag "override:apps__api-rs__src__http__admin_audit.rs" >/dev/null
+  --session eng-conflict --tag "override:$target_key" >/dev/null
 "$AB" lock reap --as codex --path "$target" --session eng-conflict --force-stale >/dev/null \
   && pass "override accepted with warning msg" \
   || fail "override rejected despite warning msg"

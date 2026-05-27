@@ -12,6 +12,7 @@ tests=(
   test_transcript.sh
   test_security.sh
   test_ux.sh
+  test_lock_key.sh
 )
 
 if [[ -t 1 ]]; then

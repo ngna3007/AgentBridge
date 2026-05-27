@@ -74,9 +74,26 @@ def cursor_path(agent: str) -> Path:
 
 
 def lock_key(repo_relative_path: str) -> str:
+    """Normalize a repo-relative path into a unique, filesystem-safe lock key.
+
+    Rules:
+      - Lowercase, forward slashes.
+      - Strip leading `./` segments. Reject any `..` segment to keep
+        the key space rooted in the working tree.
+      - Escape literal `_` in path components so `/` (encoded as `__`)
+        is an unambiguous separator: any pre-existing `_` becomes `_5f`.
+        Result: `a/b__c` → `a__b_5f_5fc`, distinct from `a__b__c` → `a_5f_5fb_5f_5fc`.
+    """
     norm = repo_relative_path.strip().lower().replace("\\", "/")
-    norm = norm.lstrip("./")
-    return norm.replace("/", "__")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    parts = [p for p in norm.split("/") if p != ""]
+    if any(p == ".." for p in parts):
+        raise ValidationError(
+            f"lock path {repo_relative_path!r} contains '..' — must stay inside repo"
+        )
+    escaped = [p.replace("_", "_5f") for p in parts]
+    return "__".join(escaped)
 
 
 def lock_path(repo_relative_path: str) -> Path:
@@ -675,13 +692,18 @@ def cmd_lock_with_hold(args: argparse.Namespace) -> int:
         print("error: no command given after `--`", file=sys.stderr)
         return 2
 
-    # Acquire (with optional wait).
+    # Block signals during acquire so a SIGINT/SIGTERM cannot land
+    # between acquire success and handler install (would orphan the lock).
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    prev_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+
     fake_args = argparse.Namespace(
         as_agent=agent, path=rel, ttl=args.ttl, reason=args.reason,
         session=session, wait=args.wait,
     )
     rc = cmd_lock_acquire(fake_args)
     if rc != 0:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prev_mask)
         return rc
 
     stop = threading.Event()
@@ -700,8 +722,12 @@ def cmd_lock_with_hold(args: argparse.Namespace) -> int:
     hb_thread.start()
 
     proc = None
+    cleaned = threading.Event()
 
     def cleanup(*_):
+        if cleaned.is_set():
+            return
+        cleaned.set()
         stop.set()
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -714,14 +740,8 @@ def cmd_lock_with_hold(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(130)))
     signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(143)))
-
-    cmd = list(args.cmd)
-    if cmd and cmd[0] == "--":
-        cmd.pop(0)
-    if not cmd:
-        print("error: no command given after `--`", file=sys.stderr)
-        cleanup()
-        return 2
+    # Handlers installed — safe to unblock signals.
+    signal.pthread_sigmask(signal.SIG_SETMASK, prev_mask)
 
     try:
         proc = sp.Popen(cmd)
