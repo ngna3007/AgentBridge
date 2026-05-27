@@ -7,6 +7,8 @@ on disk. No network listener, no broker, no cloud.
 
 - **Transport:** append-only `messages.jsonl` + `events.jsonl`
 - **Coordination:** filesystem locks (`O_EXCL`, heartbeat, TTL)
+- **Spectator TUI:** `agentbridge ui` — live curses dashboard, one-key intervention
+- **Agent verbs:** `handoff`, `ask`, `lock with-hold` cover ~90% of agent traffic
 - **Live context:** optional tmux 4-pane topology
 - **Durability:** atomic append (`fcntl.flock`) + `fsync`
 - **Footprint:** single Python file (`scripts/agentbridge`), stdlib only
@@ -31,67 +33,54 @@ Or run directly without installing — every command works from
 
 ## Quickstart
 
+Two paths, depending on whether you're the human watching or an agent
+sending.
+
+### Human spectator (zero-flag path)
+
 ```bash
-# 1. Initialize the bus in your project directory.
-agentbridge init
-
-# 2. Set your identity + session once per shell (env defaults).
-export AGENT_BRIDGE_IDENTITY=claude
-export AGENT_BRIDGE_SESSION=demo
-
-# 3. From terminal A — drive Claude's side (auto-pretty on TTY).
-agentbridge watch
-
-# 4. From terminal B — drive Codex's side.
-AGENT_BRIDGE_IDENTITY=codex agentbridge watch
-
-# 5. From terminal C — send a task and expect an ack.
-mid=$(agentbridge send --to codex --type task \
-      --subject "verify hash parity" \
-      --body  "compare rust vs sql payload strings" --ack)
-AGENT_BRIDGE_IDENTITY=codex agentbridge ack --reply-to "$mid" \
-    --body "received, running"
+agentbridge init               # bootstrap .agent-bus/ in this dir
+export AGENT_BRIDGE_IDENTITY=claude       # or codex — pick a side
+export AGENT_BRIDGE_SESSION=demo          # any session id you like
+agentbridge                    # bare invocation → launches the TUI
 ```
 
-Or use the bundled bootstrap to smoke the whole pipeline at once:
+The bare `agentbridge` call on a TTY with an initialized bus opens
+the curses dashboard: live message stream on the left, active locks
+on the right, status line + key hints on the bottom. Press `?` for
+help, `q` to quit. Keys: `s`end · `a`sk · `h`andoff · `t`ranscript ·
+`j/k` scroll · `p`ause · `r`efresh · `g/G` jump.
+
+The TUI is read-only by default — you watch the two agents
+collaborate and only step in when you choose to.
+
+### Agent path (3 verbs cover everything)
+
+```bash
+# hand off a task; optionally block until ack
+agentbridge handoff --to codex --task "ship feature" --body "details" [--wait-ack]
+
+# ask a question; blocks until an answer arrives (or --timeout)
+reply=$(agentbridge ask --to codex --subject "which port?" --body "ssl listener?")
+
+# edit a file under an auto-heartbeated, auto-released lock
+agentbridge lock with-hold --path src/foo.rs -- $EDITOR src/foo.rs
+```
+
+`handoff --wait-ack` returns a JSON summary with the ack body. `ask`
+prints just the answer body (`--json` for the full payload). `lock
+with-hold` propagates the inner command's exit code and releases on
+SIGINT/SIGTERM/normal exit — agents cannot leak locks.
+
+Fall through to the raw `send` / `ack` / `lock acquire` primitives
+only when the verbs above don't fit (fan-out, batched ops, scripted
+retries).
+
+### Smoke the whole pipeline
 
 ```bash
 scripts/bootstrap.sh
 ```
-
-### Spectator TUI (recommended for humans)
-
-```bash
-agentbridge ui                # or just `agentbridge` on a TTY with a bus
-```
-
-A curses dashboard with a live message stream, an active-lock pane,
-and one-key intervention (`s`end, `a`sk, `h`andoff, `t`ranscript).
-Press `?` inside the TUI for the full key map, `q` to quit.
-
-The TUI is read-only by default — you watch agents collaborate and
-only step in when you choose to. Bare `agentbridge` on a terminal
-with an initialized bus launches `ui` directly so a curious user can
-discover the dashboard without learning subcommands.
-
-### High-level verbs for agents
-
-Agents shouldn't have to memorize 6 commands × 30 flags. Three intent
-verbs cover ~90% of agent-to-agent traffic:
-
-```bash
-agentbridge handoff --to codex --task "ship feature" --body "details" [--wait-ack]
-agentbridge ask     --to codex --subject "which port?" --body "ssl listener?"
-agentbridge lock with-hold --path src/foo.rs -- editor src/foo.rs
-```
-
-`ask` blocks until an answer arrives (or `--timeout` expires) and
-prints the reply body. `handoff --wait-ack` returns once the
-recipient acks. `lock with-hold` auto-heartbeats and releases on
-exit/signal, so agents never leak locks.
-
-Use the raw `send`/`ack`/`lock acquire` primitives only when the
-verbs above don't fit (e.g. fan-out, batched ops, scripted retries).
 
 ### Onboard an agent in one line
 
@@ -123,7 +112,7 @@ override protocol.
                         # watch_started | ack_sent | stale_lock_reaped
                         # send_completed | corrupt_line_skipped | override_recorded
   locks/
-    <key>.lock          # one file per locked path, key = path.lower().replace('/','__')
+    <key>.lock          # one file per locked path; see `lock key` for the normalizer
   sessions/
     <session>.<agent>.log
   state/
@@ -142,6 +131,53 @@ Permissions: `0700` on directories, `0600` on JSONL files.
 
 ### `init`
 Bootstrap the bus directory layout and apply restrictive permissions.
+Idempotent: re-running on a populated bus only refreshes permissions
+and prints `bus already initialized at <root>`.
+
+### `ui`
+```
+ui [--as <agent>] [--session <id>]
+```
+Interactive curses spectator. Live message stream (color-coded by
+type), active-lock pane, and modal forms for `s`end / `a`sk /
+`h`andoff. Also reachable by bare `agentbridge` on a TTY with an
+initialized bus. Keys (also in `?` modal):
+
+| Key   | Action                              |
+|-------|-------------------------------------|
+| `s`   | send a status message               |
+| `a`   | ask a question (`requires_ack`)     |
+| `h`   | hand off a task                     |
+| `t`   | open the transcript modal           |
+| `j/k` | scroll message stream               |
+| `g/G` | jump to oldest / newest             |
+| `p`   | pause/resume live tail              |
+| `r`   | force refresh                       |
+| `?`   | help modal                          |
+| `q`   | quit (ESC also works)               |
+
+### `handoff` (composite)
+```
+handoff [--from <agent>] --to <agent> --task <subject>
+        [--body <str> | --body-file <path|->]
+        [--session <id>] [--priority <p>] [--tag <s>]...
+        [--wait-ack] [--timeout <s>]
+```
+Wraps `send --type task` + optional ack-wait. Without `--wait-ack`
+prints the new message UUID and exits. With `--wait-ack`, blocks
+up to `--timeout` (default 300s) and prints a JSON summary:
+`{handoff_id, ack_id, ack_from, ack_body}`. Exits 1 on timeout.
+
+### `ask` (composite)
+```
+ask [--from <agent>] --to <agent> --subject <str>
+    [--body <str> | --body-file <path|->]
+    [--session <id>] [--priority <p>] [--tag <s>]...
+    [--timeout <s>] [--json]
+```
+Wraps `send --type question --ack` + blocking ack-wait. Prints the
+answer body on stdout (or full message JSON with `--json`). Exits 1
+on timeout.
 
 ### `send`
 ```
@@ -203,10 +239,13 @@ lock with-hold [--as <agent>] --path <repo-rel-path>
                [--ttl <s>] [--interval <s>] [--reason <str>]
                -- <cmd> [args...]
 ```
-Lock key normalization: `lowercase(path).replace('/', '__')`. The
-`lock key` subcommand prints the normalized key for any path (handy
-for tagging warnings or grepping `events.jsonl`). Absolute paths and
-paths escaping the working tree are rejected — repo-relative only.
+Lock key normalization: lowercase, leading `./` stripped, each path
+component has its `_` escaped to `_5f`, then components joined with
+`__`. So `a/b__c` → `a__b_5f_5fc` (distinct from `a__b__c` →
+`a_5f_5fb_5f_5fc`). The `lock key` subcommand prints the normalized
+key for any path (handy for tagging warnings or grepping
+`events.jsonl`). Absolute paths and `..` segments are rejected —
+repo-relative only.
 
 Lock file is created with `O_EXCL` (first-writer-wins). `lock acquire
 --wait <s>` polls until the slot frees or the deadline expires.
@@ -362,6 +401,7 @@ Suite:
 - `test_transcript.sh` — timeline reproducible across reruns; deterministic ordering (AC5)
 - `test_security.sh`   — `0700`/`0600` perms; no listener; static no-net source check; secret scanner
 - `test_ux.sh`         — env defaults; `--pretty`/`--json`; `inbox`; `--body-file`; `lock key`/`with-hold`/`--wait`; abs-path/self-msg/reply-to guards; `agent-prompt`; `version`
+- `test_lock_key.sh`   — lock-key normalizer: `..` rejection, leading `./` strip, underscore-escape collision-freedom, absolute-path rejection
 
 ---
 
