@@ -1,6 +1,6 @@
 {
   "name": "@rowanng/agentbridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local, file-based realtime bridge between two AI coding agents (Claude ↔ Codex). Append-only JSONL messages, filesystem locks with heartbeat, curses spectator TUI. No network, no broker, no cloud. Requires Python 3.9+.",
   "bin": {
     "agentbridge": "scripts/agentbridge"

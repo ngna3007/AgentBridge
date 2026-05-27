@@ -102,7 +102,7 @@ def lock_path(repo_relative_path: str) -> Path:
 
 # ----- Env defaults --------------------------------------------------------
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 ENV_IDENTITY = "AGENT_BRIDGE_IDENTITY"
 ENV_SESSION = "AGENT_BRIDGE_SESSION"
 
@@ -2029,17 +2029,65 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _ansi(color: bool):
+    if color:
+        return {
+            "cyan": "\033[36m", "yellow": "\033[33m", "green": "\033[32m",
+            "red": "\033[31m", "bold": "\033[1m", "dim": "\033[2m",
+            "reset": "\033[0m",
+        }
+    return {k: "" for k in ("cyan", "yellow", "green", "red", "bold", "dim", "reset")}
+
+
+def _print_welcome() -> None:
+    """Friendly first-run screen when invoked bare without a bus."""
+    c = _ansi(sys.stdout.isatty() and not os.environ.get("AGENT_BRIDGE_NO_COLOR"))
+    out = sys.stdout
+
+    def line(s: str = "") -> None:
+        out.write(s + "\n")
+
+    line()
+    line(f"  {c['bold']}{c['cyan']}AgentBridge {VERSION}{c['reset']}  "
+         f"{c['dim']}— local Claude↔Codex realtime bridge{c['reset']}")
+    line()
+    line(f"  {c['yellow']}No bus found in this directory.{c['reset']}  "
+         f"{c['dim']}({bus_root()} does not exist){c['reset']}")
+    line()
+    line(f"  {c['bold']}Get started:{c['reset']}")
+    line()
+    line(f"    {c['green']}1.{c['reset']} {c['bold']}agentbridge init{c['reset']}"
+         f"                        {c['dim']}# bootstrap .agent-bus/ here{c['reset']}")
+    line(f"    {c['green']}2.{c['reset']} {c['bold']}export AGENT_BRIDGE_IDENTITY=claude{c['reset']}"
+         f"     {c['dim']}# or codex — pick a side{c['reset']}")
+    line(f"    {c['green']}3.{c['reset']} {c['bold']}export AGENT_BRIDGE_SESSION=demo{c['reset']}"
+         f"        {c['dim']}# any session id{c['reset']}")
+    line(f"    {c['green']}4.{c['reset']} {c['bold']}agentbridge{c['reset']}"
+         f"                             {c['dim']}# opens the spectator TUI{c['reset']}")
+    line()
+    line(f"  Other entry points:")
+    line(f"    {c['dim']}agentbridge --help              # full subcommand list{c['reset']}")
+    line(f"    {c['dim']}agentbridge agent-prompt        # system prompt for agents{c['reset']}")
+    line(f"    {c['dim']}agentbridge tmux                # 4-pane workspace (needs tmux){c['reset']}")
+    line()
+
+
 def main(argv: list[str] | None = None) -> int:
     effective = list(argv) if argv is not None else sys.argv[1:]
-    # Default to interactive TUI when invoked bare on a terminal with a bus.
-    if not effective and sys.stdout.isatty() and bus_root().exists():
-        effective = ["ui"]
+    # Bare invocation on a TTY: launch TUI if bus exists, else welcome screen.
+    if not effective and sys.stdout.isatty():
+        if bus_root().exists():
+            effective = ["ui"]
+        else:
+            _print_welcome()
+            return 0
     parser = build_parser()
     args = parser.parse_args(effective)
     try:
         return args.func(args)
     except ValidationError as e:
-        print(f"validation error: {e}", file=sys.stderr)
+        c = _ansi(sys.stderr.isatty() and not os.environ.get("AGENT_BRIDGE_NO_COLOR"))
+        print(f"{c['red']}error:{c['reset']} {e}", file=sys.stderr)
         return 2
 
 
